@@ -1,0 +1,56 @@
+model_name: "unsloth/Llama-3.2-1B"
+
+# 预训练层映射
+pretrained_front_layers: [0, 1]
+pretrained_column_layers: [2, 3, 4]
+pretrained_back_layers: [14, 15]
+
+# 维度 (从基座模型自动获取, 此处仅作参考)
+hidden_dim: 2048
+head_dim: 64
+num_q_heads: 32
+num_kv_heads: 8
+d_ff: 8192
+
+# 循环参数
+min_iter: 1
+max_iter: 10
+phi: 1.618
+
+# L6 Precision
+lambda_precision_init: 1.0
+precision_temperature: 0.5
+
+# HaltHead 退火
+halt_tau_start: 1.0
+halt_tau_end: 0.01
+
+# 损失权重
+lambda_pred: 0.1
+lambda_flops: 0.01
+
+# 训练 (单阶段, 8GB VRAM)
+learning_rate: 2.0e-5
+new_module_lr: 1.0e-4
+per_device_batch_size: 1
+gradient_accumulation_steps: 8
+max_seq_len: 512
+gradient_checkpointing: true
+bf16: true
+max_steps: 10000
+warmup_steps: 500
+weight_decay: 0.01
+max_grad_norm: 1.0
+
+# 数据
+dataset_name: "HuggingFaceFW/fineweb-edu"
+dataset_config: "sample-10BT"
+dataset_split: "train"
+
+# 日志
+logging_steps: 10
+save_steps: 500
+eval_steps: 500
+output_dir: "output/cct_base"
+report_to: "wandb"
+run_name: "cct-llama-1b-base"

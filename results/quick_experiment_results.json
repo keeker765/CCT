@@ -1,0 +1,116 @@
+{
+  "experiment": "CCT Quick Experiment (wikitext-2-raw-v1)",
+  "model": "Llama-3.2-1B + CCT",
+  "total_params": "701M",
+  "cct_new_params": "12.59M (1.80%)",
+  "config": {
+    "max_iter": 5,
+    "max_seq_len": 256,
+    "batch_size": 1,
+    "grad_accum": 4,
+    "effective_batch": 4,
+    "lr_base": 2e-05,
+    "lr_new": 0.0001,
+    "bf16": true,
+    "gradient_checkpointing": true
+  },
+  "training_log": [
+    {
+      "step": 0,
+      "loss": 11.9963,
+      "lm": 11.894,
+      "pred": 1.001,
+      "flops": 0.221,
+      "iters": 5,
+      "tau_halt": 1.0
+    },
+    {
+      "step": 10,
+      "loss": 11.9476,
+      "lm": 11.8452,
+      "pred": 1.0028,
+      "flops": 0.2119,
+      "iters": 5,
+      "tau_halt": 0.901
+    },
+    {
+      "step": 20,
+      "loss": 10.4376,
+      "lm": 10.3417,
+      "pred": 0.9368,
+      "flops": 0.2143,
+      "iters": 5,
+      "tau_halt": 0.802
+    },
+    {
+      "step": 30,
+      "loss": 8.9512,
+      "lm": 8.8669,
+      "pred": 0.8234,
+      "flops": 0.1955,
+      "iters": 5,
+      "tau_halt": 0.703
+    },
+    {
+      "step": 40,
+      "loss": 8.1516,
+      "lm": 8.0972,
+      "pred": 0.5308,
+      "flops": 0.1287,
+      "iters": 5,
+      "tau_halt": 0.604
+    },
+    {
+      "step": 50,
+      "loss": 7.1737,
+      "lm": 7.1379,
+      "pred": 0.3535,
+      "flops": 0.0388,
+      "iters": 5,
+      "tau_halt": 0.505
+    },
+    {
+      "step": 60,
+      "loss": 7.1118,
+      "lm": 7.092,
+      "pred": 0.1961,
+      "flops": 0.0215,
+      "iters": 5,
+      "tau_halt": 0.406
+    },
+    {
+      "step": 70,
+      "loss": 6.4506,
+      "lm": 6.4348,
+      "pred": 0.1553,
+      "flops": 0.0249,
+      "iters": 5,
+      "tau_halt": 0.307
+    },
+    {
+      "step": 80,
+      "loss": 6.2463,
+      "lm": 6.2284,
+      "pred": 0.1674,
+      "flops": 0.118,
+      "iters": 5,
+      "tau_halt": 0.208
+    },
+    {
+      "step": 90,
+      "loss": 5.6871,
+      "lm": 5.6737,
+      "pred": 0.1329,
+      "flops": 0.0101,
+      "iters": 5,
+      "tau_halt": 0.109
+    }
+  ],
+  "summary": {
+    "lm_loss_reduction": "11.89 -> 5.67 (-52.3%)",
+    "pred_loss_reduction": "1.00 -> 0.13 (-87.0%)",
+    "flops_loss_reduction": "0.22 -> 0.01 (-95.5%)",
+    "training_time": "~6 min (100 steps)",
+    "speed": "~3.6 s/step"
+  }
+}
