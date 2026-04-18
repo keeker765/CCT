@@ -222,11 +222,20 @@ class CCTLlamaModel(nn.Module):
         p_halts: List[torch.Tensor] = []
         remainders_list: List[torch.Tensor] = []
         all_scores: List[torch.Tensor] = []
+        valid_mask = None  # per-token halting 的 padding mask
 
         if self.training:
-            # 训练: 所有轮都跑, 加权和输出
-            remainder = torch.ones(batch_size, device=h.device)
+            # 训练: per-token ACT 加权和输出
+            seq_len = h.size(1)
+            remainder = torch.ones(batch_size, seq_len, device=h.device)
             output = torch.zeros_like(h)
+
+            # Padding token 不参与 halting
+            if attention_mask is not None:
+                valid_mask = attention_mask[:, :seq_len].float()
+                remainder = remainder * valid_mask
+            else:
+                valid_mask = None
 
             for k in range(self.config.max_iter):
                 # a. 3个 CCTDecoderLayer forward (共享权重)
@@ -264,11 +273,11 @@ class CCTLlamaModel(nn.Module):
                 p_halts.append(p_halt)
                 remainders_list.append(remainder.clone())
 
-                # d. ACT 加权累积: output += remainder · p_halt · h
-                weight = (remainder * p_halt).unsqueeze(-1).unsqueeze(-1)  # [batch, 1, 1]
+                # d. ACT per-token 加权累积
+                weight = (remainder * p_halt).unsqueeze(-1)  # [batch, seq_len, 1]
                 output = output + weight * h
 
-                # e. 更新 remainder
+                # e. 更新 per-token remainder
                 remainder = remainder * (1.0 - p_halt)
 
                 # f. Score (双重 detach, 共享 info_proj)
@@ -284,11 +293,21 @@ class CCTLlamaModel(nn.Module):
                     break
 
             # 分配剩余 remainder 给最后一轮
-            output = output + remainder.unsqueeze(-1).unsqueeze(-1) * h
+            output = output + remainder.unsqueeze(-1) * h
             hidden_states = output
 
         else:
-            # 推理: p_halt > 0.5 硬停止
+            # 推理: per-token ACT + remainder 判停
+            seq_len = h.size(1)
+            remainder = torch.ones(batch_size, seq_len, device=h.device)
+            output = torch.zeros_like(h)
+
+            if attention_mask is not None:
+                valid_mask = attention_mask[:, :seq_len].float()
+                remainder = remainder * valid_mask
+            else:
+                valid_mask = None
+
             for k in range(self.config.max_iter):
                 precision_bias = None
                 if k > 0 and all_scores:
@@ -308,14 +327,22 @@ class CCTLlamaModel(nn.Module):
 
                 p_halt = self.halt_head(h, tau_halt)
 
+                # Per-token ACT 累积
+                weight = (remainder * p_halt).unsqueeze(-1)
+                output = output + weight * h
+                remainder = remainder * (1.0 - p_halt)
+
                 # Score for precision
                 score = self.cct_predictor.compute_score(h, x_column)
                 all_scores.append(score)
 
-                if k >= self.config.min_iter - 1 and p_halt.mean().item() > 0.5:
+                # 所有有效 token 的 remainder 都足够小时停止
+                if k >= self.config.min_iter - 1 and remainder.max().item() < 1e-3:
                     break
 
-            hidden_states = h
+            # 分配剩余 remainder
+            output = output + remainder.unsqueeze(-1) * h
+            hidden_states = output
 
         # === 4. Fixed Back ===
         for layer in self.back_layers:
@@ -338,6 +365,8 @@ class CCTLlamaModel(nn.Module):
                 remainders=remainders_list,
                 lambda_pred=self.config.lambda_pred,
                 lambda_flops=self.config.lambda_flops,
+                lambda_entropy=self.config.lambda_entropy,
+                valid_mask=valid_mask,
             )
 
         return {
