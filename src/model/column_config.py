@@ -44,8 +44,10 @@ class CCTConfig:
 
     # 损失权重
     lambda_pred: float = 0.1
-    lambda_flops: float = 0.01
     lambda_entropy: float = 0.01  # halting 熵正则 (最小化 → 锐利停止决策)
+
+    # 推理温度 (控制推理强度)
+    inference_temperature: float = 1.0  # >1 → 更多迭代 (尤其 hard token); <1 → 更少迭代
 
     # 训练
     learning_rate: float = 2e-5

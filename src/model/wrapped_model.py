@@ -3,9 +3,9 @@
 架构: Fixed Front (2层) → Column (3层 × K循环) → Fixed Back (2层)
 预训练层映射: Layer 0,1 → Front; Layer 2,3,4 → Column; Layer 14,15 → Back
 
-ACT 软停止 + 温度退火:
-- 训练: 所有轮都跑, 输出 = 加权和 (remainder × p_halt × h)
-- 推理: p_halt > 0.5 硬停止
+Per-token ACT + 温度退火:
+- 训练: 所有轮都跑, 输出 = per-token 加权和 (remainder × p_halt × h)
+- 推理: 同机制, remainder < threshold 时早停; inference_temperature 控制推理强度
 - τ_halt 从 1.0 退火到 0.01 → 训练/推理一致
 """
 
@@ -297,7 +297,7 @@ class CCTLlamaModel(nn.Module):
             hidden_states = output
 
         else:
-            # 推理: per-token ACT + remainder 判停
+            # 推理: per-token ACT + inference_temperature 控制推理强度
             seq_len = h.size(1)
             remainder = torch.ones(batch_size, seq_len, device=h.device)
             output = torch.zeros_like(h)
@@ -307,6 +307,9 @@ class CCTLlamaModel(nn.Module):
                 remainder = remainder * valid_mask
             else:
                 valid_mask = None
+
+            # 推理温度: >1 → 更多迭代 (尤其 hard token); <1 → 更少迭代
+            inf_tau = tau_halt * self.config.inference_temperature
 
             for k in range(self.config.max_iter):
                 precision_bias = None
@@ -325,7 +328,7 @@ class CCTLlamaModel(nn.Module):
 
                 h = self.inter_iter_norm(h)
 
-                p_halt = self.halt_head(h, tau_halt)
+                p_halt = self.halt_head(h, inf_tau)
 
                 # Per-token ACT 累积
                 weight = (remainder * p_halt).unsqueeze(-1)
@@ -364,7 +367,6 @@ class CCTLlamaModel(nn.Module):
                 p_halts=p_halts,
                 remainders=remainders_list,
                 lambda_pred=self.config.lambda_pred,
-                lambda_flops=self.config.lambda_flops,
                 lambda_entropy=self.config.lambda_entropy,
                 valid_mask=valid_mask,
             )

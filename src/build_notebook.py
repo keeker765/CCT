@@ -59,7 +59,7 @@ def cells_header() -> List[dict]:
 - **HaltHead**: ACT 软停止 + τ 退火二值化
 - **RotaryCycleEmbed**: φ 黄金比例旋转循环嵌入
 
-**损失**: L_LM + λ_pred · L_pred + λ_flops · L_flops
+**损失**: L_LM + λ_pred · L_pred + λ_entropy · H(halt)
 
 **流程**: 安装 → 下载代码 → 数据+模型 → 训练 → 评估 → 可视化 → 备份"""),
     ]
@@ -228,7 +228,7 @@ DTYPE = torch.bfloat16
 cct_config = CCTConfig(
     max_iter=5,
     lambda_pred=0.1,
-    lambda_flops=0.01,
+    lambda_entropy=0.01,
     bf16=True,
     gradient_checkpointing=True,
 )
@@ -287,7 +287,7 @@ model.train()
 _t0 = _time.time()
 
 for epoch in range(CFG['num_epochs']):
-    avg = {'total': 0, 'lm': 0, 'pred': 0, 'flops': 0, 'iters': 0}
+    avg = {'total': 0, 'lm': 0, 'pred': 0, 'entropy': 0, 'iters': 0}
     avg_n = 0
 
     for bi, batch in enumerate(train_loader):
@@ -314,7 +314,7 @@ for epoch in range(CFG['num_epochs']):
         avg['total'] += ld.get('loss_total', 0)
         avg['lm'] += ld.get('loss_lm', 0)
         avg['pred'] += ld.get('loss_pred', 0)
-        avg['flops'] += ld.get('loss_flops', 0)
+        avg['entropy'] += ld.get('loss_entropy', 0)
         avg['iters'] += out.get('num_iterations', 0)
         avg_n += 1
 
@@ -322,11 +322,11 @@ for epoch in range(CFG['num_epochs']):
             n = max(avg_n, 1)
             elapsed = _time.time() - _t0
             eta_m = (elapsed / gs) * (total_steps - gs) / 60 if gs > 0 else 0
-            print('[Step %d/%d] loss=%.4f | lm=%.4f pred=%.4f flops=%.4f | '
+            print('[Step %d/%d] loss=%.4f | lm=%.4f pred=%.4f ent=%.4f | '
                   'iters=%.1f tau=%.3f | ETA %.0fm' % (
                 gs, total_steps, avg['total']/n, avg['lm']/n, avg['pred']/n,
-                avg['flops']/n, avg['iters']/n, tau_halt, eta_m))
-            avg = {'total': 0, 'lm': 0, 'pred': 0, 'flops': 0, 'iters': 0}
+                avg['entropy']/n, avg['iters']/n, tau_halt, eta_m))
+            avg = {'total': 0, 'lm': 0, 'pred': 0, 'entropy': 0, 'iters': 0}
             avg_n = 0
 
         if gs > 0 and gs % CFG['eval_interval'] == 0 and (bi + 1) % CFG['grad_accum'] == 0:

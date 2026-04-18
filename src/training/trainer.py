@@ -125,7 +125,7 @@ class CCTTrainer:
                     f"loss={loss_dict.get('loss_total', 0):.4f} | "
                     f"lm={loss_dict.get('loss_lm', 0):.4f} | "
                     f"pred={loss_dict.get('loss_pred', 0):.4f} | "
-                    f"flops={loss_dict.get('loss_flops', 0):.4f} | "
+                    f"entropy={loss_dict.get('loss_entropy', 0):.4f} | "
                     f"iters={num_iter} | τ_halt={tau_halt:.4f}"
                 )
 
