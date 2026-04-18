@@ -238,7 +238,10 @@ class CCTLlamaModel(nn.Module):
                 valid_mask = None
 
             for k in range(self.config.max_iter):
-                # a. 3个 CCTDecoderLayer forward (共享权重)
+                # a. 保存列运算前的状态 (用于前向预测)
+                h_before = h
+
+                # b. 3个 CCTDecoderLayer forward (共享权重)
                 precision_bias = None
                 if k > 0 and all_scores:
                     precision_bias = self.l6_precision(all_scores[-1])
@@ -265,27 +268,27 @@ class CCTLlamaModel(nn.Module):
                             precision_bias=precision_bias,
                         )
 
-                # b. 迭代间 RMSNorm (防发散)
+                # c. 迭代间 RMSNorm (防发散)
                 h = self.inter_iter_norm(h)
 
-                # c. HaltHead
+                # d. HaltHead
                 p_halt = self.halt_head(h, tau_halt)
                 p_halts.append(p_halt)
                 remainders_list.append(remainder.clone())
 
-                # d. ACT per-token 加权累积
+                # e. ACT per-token 加权累积
                 weight = (remainder * p_halt).unsqueeze(-1)  # [batch, seq_len, 1]
                 output = output + weight * h
 
-                # e. 更新 per-token remainder
+                # f. 更新 per-token remainder
                 remainder = remainder * (1.0 - p_halt)
 
-                # f. Score (双重 detach, 共享 info_proj)
-                score = self.cct_predictor.compute_score(h, x_column)
+                # g. 前向预测 Score: predict h_k from h_{k-1}
+                score = self.cct_predictor.compute_score(h_before, h)
                 all_scores.append(score)
 
-                # g. L_pred (双重 detach 防崩塌)
-                l_pred_k = self.cct_predictor.compute_pred_loss(h, x_column)
+                # h. 前向预测 L_pred: 列变换可预测性
+                l_pred_k = self.cct_predictor.compute_pred_loss(h_before, h)
                 pred_losses.append(l_pred_k)
 
                 # h. 提前退出优化 (remainder 极小时无意义继续)
@@ -312,6 +315,8 @@ class CCTLlamaModel(nn.Module):
             inf_tau = tau_halt * self.config.inference_temperature
 
             for k in range(self.config.max_iter):
+                h_before = h
+
                 precision_bias = None
                 if k > 0 and all_scores:
                     precision_bias = self.l6_precision(all_scores[-1])
@@ -335,8 +340,8 @@ class CCTLlamaModel(nn.Module):
                 output = output + weight * h
                 remainder = remainder * (1.0 - p_halt)
 
-                # Score for precision
-                score = self.cct_predictor.compute_score(h, x_column)
+                # 前向预测 Score: predict h_k from h_{k-1}
+                score = self.cct_predictor.compute_score(h_before, h)
                 all_scores.append(score)
 
                 # 所有有效 token 的 remainder 都足够小时停止

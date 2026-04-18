@@ -1,20 +1,23 @@
-"""CCT Predictor — info_proj + predictor head (与 PPG 一致)
+"""CCT Predictor — 前向预测 (predict column output BEFORE seeing it)
 
-设计:
-1. info_proj: Linear(d_model → info_dim, bias=False) — 投影到比较空间
-2. predictor: Linear(info_dim → info_dim) — 在比较空间中预测 anchor
+设计 (与 PPG GroupPredictor 完全对齐):
+  PPG:  predict(info_proj(h_before_anchor))  vs  info_proj(h_after_anchor)
+  CCT:  predict(info_proj(h_before_column))  vs  info_proj(h_after_column)
 
-为什么需要两层:
-- 只有 info_proj 时, info_proj(h) ≈ info_proj(x_column) → 平凡解 (cos_sim≈1)
-- 加 predictor 后: predictor(info_proj(h)) ≠ info_proj(x_column) → 必须学习真正的预测
-- 这与 PPG (GroupPredictor) 的设计完全一致
+为什么旧设计 (predict x_column from h) 会崩塌:
+  当 eff_iters≈1 时, h ≈ x_column → info_proj(h) ≈ info_proj(x_column) → cos_sim≈1
+  无论加多少层 predictor head, 任务本身就太简单了
 
-梯度流向:
-  预测侧: h.detach() → info_proj → predictor → z_pred
-           ✓ info_proj 和 predictor 都获得梯度
+为什么新设计 (predict h_k from h_{k-1}) 不会:
+  h_{k-1} 和 h_k 经过 3 层 column 变换, 有 6 次残差 + self-attn + FFN
+  即使 column 接近恒等, 变换 Δ 也是 token-dependent → 有意义的 per-token 方差
+  predictor 必须学会预测 column 的变换行为, 而非简单恒等映射
 
-  目标侧: x_column.detach() → info_proj → z_anchor.detach()
-           ✗ info_proj 不从此侧获得梯度 (第2次 detach)
+梯度流向 (与 PPG 一致):
+  预测侧: h_prev.detach() → info_proj → predictor → z_pred
+           ✓ info_proj + predictor 获得梯度
+  目标侧: h_curr.detach() → info_proj → z_anchor.detach()
+           ✗ 双重 detach 防止共享投影坍缩
 """
 
 import torch
@@ -24,9 +27,9 @@ import math
 
 
 class CCTPredictor(nn.Module):
-    """info_proj + predictor 双层预测器
+    """前向预测器: predict column output from pre-column state
 
-    info_proj: Linear(d_model → info_dim, bias=False)
+    info_proj: Linear(d_model → info_dim, bias=False) — 共享投影
     predictor: Linear(info_dim → info_dim) — 预测 head
     """
 
@@ -37,49 +40,50 @@ class CCTPredictor(nn.Module):
         self.predictor = nn.Linear(info_dim, info_dim)
 
     def project(self, x: torch.Tensor) -> torch.Tensor:
-        """投影到 info 空间 (仅 info_proj, 用于 anchor)"""
+        """投影到 info 空间 (用于 anchor/target)"""
         return self.info_proj(x.to(self.info_proj.weight.dtype))
 
-    def predict(self, x: torch.Tensor) -> torch.Tensor:
-        """预测: info_proj → predictor (用于 prediction 侧)"""
-        z = self.project(x)
+    def predict(self, h_prev: torch.Tensor) -> torch.Tensor:
+        """预测下一轮 column 输出的 info 表征"""
+        z = self.project(h_prev)
         return self.predictor(z)
 
     def compute_pred_loss(
-        self, h: torch.Tensor, x_column: torch.Tensor
+        self, h_prev: torch.Tensor, h_curr: torch.Tensor
     ) -> torch.Tensor:
-        """计算预测损失 L_pred
+        """L_pred: 预测列变换的准确度
 
-        prediction = predictor(info_proj(h.detach()))    — 2 层
-        z_anchor = info_proj(x_column.detach()).detach() — 1 层 + detach
+        prediction = predictor(info_proj(h_prev.detach()))   — 从上一轮状态预测
+        z_anchor = info_proj(h_curr.detach()).detach()        — 实际列输出
 
         Args:
-            h: [batch, seq_len, d_model] — Column 循环输出
-            x_column: [batch, seq_len, d_model] — Column 原始输入
+            h_prev: [B, T, D] — 列运算前的状态 (iteration k-1 的输出, 或 x_column at k=0)
+            h_curr: [B, T, D] — 列运算后的状态 (iteration k 的输出)
         Returns:
             loss: 标量
         """
-        z_pred = self.predict(h.detach())
-        z_anchor = self.project(x_column.detach()).detach()
+        z_pred = self.predict(h_prev.detach())
+        z_anchor = self.project(h_curr.detach()).detach()
         cos_sim = F.cosine_similarity(
             z_pred.float(), z_anchor.float(), dim=-1
         )
         return (1.0 - cos_sim).mean()
 
     def compute_score(
-        self, h: torch.Tensor, x_column: torch.Tensor
+        self, h_prev: torch.Tensor, h_curr: torch.Tensor
     ) -> torch.Tensor:
-        """计算 per-token prediction score (双重 detach)
+        """Per-token prediction score: column 输出的可预测性
 
-        score_t = dot(z_pred_t, z_anchor_t) / √info_dim
+        高 score → 列变换可预测 → 低 precision → 正常 attention
+        低 score → 列变换出乎意料 → 高 precision → 增强 attention
 
         Args:
-            h: [batch, seq_len, d_model]
-            x_column: [batch, seq_len, d_model]
+            h_prev: [B, T, D] — 列运算前
+            h_curr: [B, T, D] — 列运算后
         Returns:
-            score: [batch, seq_len]
+            score: [B, T]
         """
-        z_pred = self.predict(h).detach()
-        z_anchor = self.project(x_column.detach()).detach()
+        z_pred = self.predict(h_prev).detach()
+        z_anchor = self.project(h_curr.detach()).detach()
         score = (z_pred * z_anchor).sum(dim=-1) / math.sqrt(self.info_dim)
         return score
