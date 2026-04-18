@@ -158,6 +158,9 @@ CFG = {{
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
+# 强制右侧 padding: 左侧 padding 会导致 labels[:prompt_len] mask 错位
+tokenizer.padding_side = 'right'
+print('padding_side:', tokenizer.padding_side)
 
 # unsloth/Llama-3.2-1B 是 base 模型, 没有 chat_template, 手动设置
 LLAMA3_CHAT_TEMPLATE = '{_CHAT_TEMPLATE}'
@@ -222,6 +225,14 @@ _pv = SFTDataset([raw[0]], tokenizer, max_length=128, max_samples=1)
 print('=== Chat Template 预览 ===')
 print(tokenizer.decode(_pv[0]['input_ids'][:80]))
 print('...\\n')
+
+# labels 健全性检查
+_s = _pv[0]
+_valid_labels = (_s['labels'] != -100).sum().item()
+_total_attn = _s['attention_mask'].sum().item()
+print('Labels check: valid=%d, attn_ones=%d (valid < attn_ones = prompt correctly masked)' % (
+    _valid_labels, _total_attn))
+assert _valid_labels < _total_attn, 'BUG: prompt tokens not masked in labels!'
 
 full_ds = SFTDataset(raw, tokenizer, max_length=512, max_samples=CFG['max_samples'])
 eval_sz = int(len(full_ds) * 0.05)
@@ -437,6 +448,9 @@ def greedy_generate(model, input_ids, max_new_tokens=128):
             break
     return ids
 
+# 访问底层 SFTDataset.data (eval_ds 是 Subset)
+_base_ds = eval_ds.dataset if hasattr(eval_ds, 'dataset') else eval_ds
+
 # 从 eval 集随机抽 5 个样本
 import random
 random.seed(42)
@@ -447,7 +461,9 @@ print('推理测试: eval 集中抽取 %d 个问题' % len(sample_indices))
 print('=' * 80)
 
 for idx_i, si in enumerate(sample_indices):
-    text, prompt_len = eval_ds.data[si]
+    # Subset: eval_ds.indices[si] → 原始 SFTDataset 的真实 index
+    real_idx = eval_ds.indices[si] if hasattr(eval_ds, 'indices') else si
+    text, prompt_len = _base_ds.data[real_idx]
     prompt_ids = tokenizer(text, truncation=True, max_length=CFG['max_seq_len'],
                           add_special_tokens=False)['input_ids'][:prompt_len]
     full_ids = tokenizer(text, truncation=True, max_length=CFG['max_seq_len'],
@@ -461,7 +477,7 @@ for idx_i, si in enumerate(sample_indices):
     gen_text = tokenizer.decode(gen_ids[0][len(prompt_ids):], skip_special_tokens=True)
     prompt_text = tokenizer.decode(prompt_ids, skip_special_tokens=True)
 
-    print('\\n--- Sample %d (eval idx=%d) ---' % (idx_i + 1, si))
+    print('\\n--- Sample %d (eval idx=%d, real=%d) ---' % (idx_i + 1, si, real_idx))
     print('[PROMPT] %s' % prompt_text[:300])
     print('[GROUND TRUTH] %s' % gt_text[:500])
     print('[MODEL OUTPUT] %s' % gen_text[:500])

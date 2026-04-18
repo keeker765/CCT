@@ -111,6 +111,8 @@ CFG = {{
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = 'right'
+print('padding_side:', tokenizer.padding_side)
 
 LLAMA3_CHAT_TEMPLATE = '{_CHAT_TEMPLATE}'
 if tokenizer.chat_template is None:
