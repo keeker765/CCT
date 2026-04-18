@@ -23,7 +23,7 @@ class CCTConfig:
 
     # 预训练层映射
     pretrained_front_layers: List[int] = field(default_factory=lambda: [0, 1])
-    pretrained_column_layers: List[int] = field(default_factory=lambda: [2, 3, 4])
+    pretrained_column_layers: List[int] = field(default_factory=lambda: [2, 7, 12])
     pretrained_back_layers: List[int] = field(default_factory=lambda: [14, 15])
 
     # 循环参数
