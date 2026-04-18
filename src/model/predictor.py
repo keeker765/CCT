@@ -1,20 +1,23 @@
 """CCT Predictor — 共享 info_proj + 双重 detach 防崩塌
 
-设计来自 PPG (layerPickerLLM), 核心思想:
-1. info_proj: 共享投影, 将 d_model → info_dim (降维)
-2. predictor: 在 info_dim 空间中做预测
-3. 双重 detach: 防止表征崩塌 (representation collapse)
+设计:
+1. info_proj: 共享投影 d_model → info_dim, 将 h 和 x_column 映射到同一比较空间
+2. 双重 detach: 目标侧 .detach() 防止崩塌
 
 梯度流向:
-  预测侧: h.detach() → info_proj → predictor → prediction
-           ✓ info_proj 获得梯度    ✓ predictor 获得梯度
+  预测侧: h.detach() → info_proj → z_pred
+           ✓ info_proj 获得梯度
 
   目标侧: x_column.detach() → info_proj → z_anchor.detach()
            ✗ info_proj 不从此侧获得梯度 (第2次 detach)
 
-为什么用余弦距离而非 MSE?
-- MSE 可被 info_proj 缩小输出 norm 来作弊 (error→0 但没学到真正预测)
-- 余弦距离只比较方向, 不受 norm 影响 → 必须学到真正的方向预测
+为什么需要 info_proj:
+- h 经过旋转循环编码 + Column 层处理, 与 x_column 分布不同
+- info_proj 将两者投影到共同的低维比较空间
+
+为什么用余弦距离而非 MSE:
+- MSE 可被 info_proj 缩小输出 norm 来作弊
+- 余弦距离只比较方向, 必须学到真正的方向预测
 """
 
 import torch
@@ -24,37 +27,18 @@ import math
 
 
 class CCTPredictor(nn.Module):
-    """共享 info_proj 预测器 (PPG 风格)
+    """共享 info_proj 预测器
 
-    info_proj: Linear(d_model → info_dim, bias=False) — 共享
-    predictor: Linear(info_dim → info_dim) — 仅预测侧
+    info_proj: Linear(d_model → info_dim, bias=False) — 一层投影
     """
 
     def __init__(self, d_model: int, info_dim: int = 256):
         super().__init__()
         self.info_dim = info_dim
         self.info_proj = nn.Linear(d_model, info_dim, bias=False)
-        self.predictor = nn.Linear(info_dim, info_dim)
-
-    def predict(self, h: torch.Tensor) -> torch.Tensor:
-        """预测侧: info_proj → predictor
-
-        Args:
-            h: [batch, seq_len, d_model] — 当前循环输出
-        Returns:
-            prediction: [batch, seq_len, info_dim]
-        """
-        z = self.info_proj(h.to(self.info_proj.weight.dtype))
-        return self.predictor(z)
 
     def project(self, x: torch.Tensor) -> torch.Tensor:
-        """投影到 info 空间 (用于目标侧和 score)
-
-        Args:
-            x: [batch, seq_len, d_model]
-        Returns:
-            z: [batch, seq_len, info_dim]
-        """
+        """投影到 info 空间"""
         return self.info_proj(x.to(self.info_proj.weight.dtype))
 
     def compute_pred_loss(
@@ -62,12 +46,11 @@ class CCTPredictor(nn.Module):
     ) -> torch.Tensor:
         """计算预测损失 L_pred (双重 detach 防崩塌)
 
-        L_pred = 1 - cos_sim(predictor(info_proj(h.detach())),
+        L_pred = 1 - cos_sim(info_proj(h.detach()),
                               info_proj(x_column.detach()).detach())
 
         第1次 detach (h.detach, x_column.detach): 隔离基座模型梯度
         第2次 detach (z_anchor.detach): 阻止 L_pred 从目标侧更新 info_proj
-          → info_proj 仅从预测侧获得梯度, 防止共享投影坍缩
 
         Args:
             h: [batch, seq_len, d_model] — Column 循环输出
@@ -75,10 +58,10 @@ class CCTPredictor(nn.Module):
         Returns:
             loss: 标量
         """
-        prediction = self.predict(h.detach())
-        z_anchor = self.project(x_column.detach()).detach()  # 第2次 detach!
+        z_pred = self.project(h.detach())
+        z_anchor = self.project(x_column.detach()).detach()
         cos_sim = F.cosine_similarity(
-            prediction.float(), z_anchor.float(), dim=-1
+            z_pred.float(), z_anchor.float(), dim=-1
         )
         return (1.0 - cos_sim).mean()
 
@@ -88,11 +71,10 @@ class CCTPredictor(nn.Module):
         """计算 per-token prediction score (双重 detach)
 
         score_t = dot(z_pred_t, z_anchor_t) / √info_dim
-        用于生成 precision 信号, 不创建梯度回路。
 
         Args:
-            h: [batch, seq_len, d_model] — Column 循环输出
-            x_column: [batch, seq_len, d_model] — Column 原始输入
+            h: [batch, seq_len, d_model]
+            x_column: [batch, seq_len, d_model]
         Returns:
             score: [batch, seq_len]
         """
