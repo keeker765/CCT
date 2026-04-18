@@ -74,6 +74,9 @@ class CCTPredictor(nn.Module):
     ) -> torch.Tensor:
         """Per-token prediction score: column 输出的可预测性
 
+        使用 cosine similarity (有界 [-1, 1])，确保下游 L6Precision
+        的 sigmoid(score / tau_p) 不会因 score 过大而饱和。
+
         高 score → 列变换可预测 → 低 precision → 正常 attention
         低 score → 列变换出乎意料 → 高 precision → 增强 attention
 
@@ -81,9 +84,9 @@ class CCTPredictor(nn.Module):
             h_prev: [B, T, D] — 列运算前
             h_curr: [B, T, D] — 列运算后
         Returns:
-            score: [B, T]
+            score: [B, T] — cosine similarity, 范围 [-1, 1]
         """
         z_pred = self.predict(h_prev).detach()
         z_anchor = self.project(h_curr.detach()).detach()
-        score = (z_pred * z_anchor).sum(dim=-1) / math.sqrt(self.info_dim)
+        score = F.cosine_similarity(z_pred.float(), z_anchor.float(), dim=-1)
         return score
