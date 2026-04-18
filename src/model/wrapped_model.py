@@ -140,30 +140,61 @@ class CCTLlamaModel(nn.Module):
         past_key_values=None,
         cache_position=None,
     ) -> Optional[torch.Tensor]:
-        """构建因果注意力掩码"""
-        if attention_mask is None or create_causal_mask is None:
-            return None
+        """构建因果注意力掩码
 
-        mask_kwargs = {}
-        if "config" in _MASK_PARAMS:
-            mask_kwargs["config"] = self.base_config
-        if "inputs_embeds" in _MASK_PARAMS:
-            mask_kwargs["inputs_embeds"] = hidden_states
-        if "input_tensor" in _MASK_PARAMS:
-            mask_kwargs["input_tensor"] = hidden_states
-        if "attention_mask" in _MASK_PARAMS:
-            mask_kwargs["attention_mask"] = attention_mask
-        if "past_key_values" in _MASK_PARAMS:
-            mask_kwargs["past_key_values"] = past_key_values
-        if "position_ids" in _MASK_PARAMS:
-            mask_kwargs["position_ids"] = position_ids
-        if "cache_position" in _MASK_PARAMS:
-            mask_kwargs["cache_position"] = cache_position
+        优先使用 transformers 内置 create_causal_mask；
+        若返回 None（transformers 5.x 在 _attn_implementation 未设置时会跳过），
+        则手动构建标准上三角因果掩码，确保 CCTAttention 等手动注意力模块
+        不会泄露未来 token 信息。
+        """
+        causal_mask = None
 
-        try:
-            return create_causal_mask(**mask_kwargs)
-        except Exception:
-            return None
+        # 尝试 transformers 内置方法
+        if attention_mask is not None and create_causal_mask is not None:
+            mask_kwargs = {}
+            if "config" in _MASK_PARAMS:
+                mask_kwargs["config"] = self.base_config
+            if "inputs_embeds" in _MASK_PARAMS:
+                mask_kwargs["inputs_embeds"] = hidden_states
+            if "input_tensor" in _MASK_PARAMS:
+                mask_kwargs["input_tensor"] = hidden_states
+            if "attention_mask" in _MASK_PARAMS:
+                mask_kwargs["attention_mask"] = attention_mask
+            if "past_key_values" in _MASK_PARAMS:
+                mask_kwargs["past_key_values"] = past_key_values
+            if "position_ids" in _MASK_PARAMS:
+                mask_kwargs["position_ids"] = position_ids
+            if "cache_position" in _MASK_PARAMS:
+                mask_kwargs["cache_position"] = cache_position
+
+            try:
+                causal_mask = create_causal_mask(**mask_kwargs)
+            except Exception:
+                causal_mask = None
+
+        # 回退：手动构建因果掩码（上三角 -inf）
+        if causal_mask is None:
+            seq_len = hidden_states.shape[1]
+            causal_mask = torch.triu(
+                torch.full(
+                    (seq_len, seq_len),
+                    torch.finfo(hidden_states.dtype).min,
+                    device=hidden_states.device,
+                    dtype=hidden_states.dtype,
+                ),
+                diagonal=1,
+            )
+            # 扩展到 4D: [1, 1, seq_len, seq_len]，兼容 multi-head attention
+            causal_mask = causal_mask.unsqueeze(0).unsqueeze(0)
+
+            # 如果有 2D padding mask，将 padding 位置也屏蔽
+            if attention_mask is not None and attention_mask.ndim == 2:
+                # attention_mask: [batch, seq_len], 1=有效, 0=padding
+                padding_mask = attention_mask[:, None, None, :]  # [B, 1, 1, S]
+                padding_mask = (1.0 - padding_mask.to(causal_mask.dtype)) * torch.finfo(hidden_states.dtype).min
+                causal_mask = causal_mask + padding_mask
+
+        return causal_mask
 
     def _run_standard_layer(
         self, layer: nn.Module, hidden_states: torch.Tensor, layer_kwargs: dict
