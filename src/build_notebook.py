@@ -166,6 +166,9 @@ else:
     print('Tokenizer 已有 chat_template')
 
 # === 数据集 (Alpaca SFT) ===
+# 标准 SFT: 只计算 assistant response 部分的 loss, mask 掉 instruction
+ASSISTANT_HEADER = '<|start_header_id|>assistant<|end_header_id|>'
+
 class SFTDataset(Dataset):
     def __init__(self, dataset, tokenizer, max_length=512, max_samples=None):
         self.tokenizer = tokenizer
@@ -178,25 +181,33 @@ class SFTDataset(Dataset):
                 inp = ex.get('input', '').strip()
                 if inp:
                     user_msg += '\\n\\n' + inp
-                messages = [
-                    {{'role': 'user', 'content': user_msg}},
-                    {{'role': 'assistant', 'content': ex.get('output', '')}},
-                ]
-                text = tokenizer.apply_chat_template(
-                    messages, tokenize=False, add_generation_prompt=False)
+                # 分别构造 prompt (user) 和 completion (assistant)
+                prompt_msgs = [{{'role': 'user', 'content': user_msg}}]
+                full_msgs = prompt_msgs + [{{'role': 'assistant', 'content': ex.get('output', '')}}]
+                prompt_text = tokenizer.apply_chat_template(
+                    prompt_msgs, tokenize=False, add_generation_prompt=True)
+                full_text = tokenizer.apply_chat_template(
+                    full_msgs, tokenize=False, add_generation_prompt=False)
+                # 计算 prompt 的 token 长度, 用于 mask labels
+                prompt_len = len(tokenizer(prompt_text, add_special_tokens=False)['input_ids'])
+                self.data.append((full_text, prompt_len))
             elif 'text' in ex:
-                text = ex['text']
+                self.data.append((ex['text'], 0))
             else:
                 continue
-            self.data.append(text)
     def __len__(self): return len(self.data)
     def __getitem__(self, idx):
-        enc = self.tokenizer(self.data[idx], truncation=True,
+        text, prompt_len = self.data[idx]
+        enc = self.tokenizer(text, truncation=True,
                              max_length=self.max_length,
                              padding='max_length', return_tensors='pt')
         input_ids = enc['input_ids'].squeeze(0)
         attn = enc['attention_mask'].squeeze(0)
-        labels = input_ids.clone(); labels[attn == 0] = -100
+        labels = input_ids.clone()
+        labels[attn == 0] = -100
+        # mask instruction 部分: 只计算 assistant response 的 loss
+        if prompt_len > 0:
+            labels[:prompt_len] = -100
         return {{'input_ids': input_ids, 'attention_mask': attn, 'labels': labels}}
 
 # 预览
