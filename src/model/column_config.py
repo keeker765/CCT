@@ -45,8 +45,8 @@ class CCTConfig:
     # 损失权重
     lambda_pred: float = 0.1
     lambda_entropy: float = 0.01  # halting 熵正则 (最小化 → 锐利停止决策)
-    lambda_ponder: float = 0.001  # ponder cost (惩罚深度, 打破退化解)
-    use_ponder_cost: bool = True  # 开关: False 可禁用 L_ponder
+    lambda_ponder: float = 0.0  # ponder cost (已关闭: eff_iters→1 过快)
+    use_ponder_cost: bool = False  # 开关: 关闭 L_ponder 以避免压制迭代
 
     # 推理温度 (控制推理强度)
     inference_temperature: float = 1.0  # >1 → 更多迭代 (尤其 hard token); <1 → 更少迭代

@@ -229,8 +229,8 @@ cct_config = CCTConfig(
     max_iter=5,
     lambda_pred=0.1,
     lambda_entropy=0.01,
-    lambda_ponder=0.001,
-    use_ponder_cost=True,
+    lambda_ponder=0.0,
+    use_ponder_cost=False,
     bf16=True,
     gradient_checkpointing=True,
 )
