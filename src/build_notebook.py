@@ -97,6 +97,11 @@ else:
     print("克隆私有仓库...")
     subprocess.run(["git", "clone", REPO_URL, WORK_DIR], check=True)
 
+# 安全: 清除 remote URL 中的 PAT, 防止泄露
+subprocess.run(["git", "-C", WORK_DIR, "remote", "set-url", "origin",
+                "https://github.com/{GH_REPO}.git"], check=False)
+del GH_TOKEN, REPO_URL
+
 os.chdir(WORK_DIR)
 print("CWD: %s" % os.getcwd())
 
@@ -217,17 +222,31 @@ eval_sz = int(len(full_ds) * 0.05)
 train_ds, eval_ds = random_split(full_ds, [len(full_ds) - eval_sz, eval_sz])
 print('Train: %d, Eval: %d' % (len(train_ds), len(eval_ds)))
 
+# === GPU 检测 + dtype 选择 ===
+assert torch.cuda.is_available(), 'Need GPU!'
+USE_BF16 = torch.cuda.is_bf16_supported()
+DTYPE = torch.bfloat16 if USE_BF16 else torch.float16
+print('GPU: %s, VRAM: %.1f GB, dtype: %s' % (
+    torch.cuda.get_device_name(), torch.cuda.get_device_properties(0).total_mem / 1e9,
+    'bf16' if USE_BF16 else 'fp16'))
+
+# 小显存自动降 batch_size
+vram_gb = torch.cuda.get_device_properties(0).total_mem / 1e9
+if vram_gb < 20 and CFG['batch_size'] > 8:
+    CFG['batch_size'] = 8
+    print('VRAM < 20GB, batch_size 降至 %d' % CFG['batch_size'])
+
 # === 模型 ===
 cct_config = CCTConfig(
     max_iter=5,
     lambda_pred=0.1,
     lambda_flops=0.01,
-    bf16=True,
+    bf16=USE_BF16,
     gradient_checkpointing=True,
 )
 
 base = LlamaForCausalLM.from_pretrained(
-    MODEL_NAME, torch_dtype=torch.bfloat16, trust_remote_code=True)
+    MODEL_NAME, torch_dtype=DTYPE, trust_remote_code=True)
 model = CCTLlamaModel(base, cct_config)
 
 # 释放 base 模型, 节省 ~2GB GPU 内存
@@ -291,7 +310,7 @@ for epoch in range(CFG['num_epochs']):
                                    cct_config.halt_tau_start, cct_config.halt_tau_end)
         model.set_halt_tau(tau_halt)
 
-        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+        with torch.amp.autocast('cuda', dtype=DTYPE):
             out = model(input_ids=batch['input_ids'],
                        attention_mask=batch['attention_mask'],
                        labels=batch['labels'])
@@ -328,7 +347,7 @@ for epoch in range(CFG['num_epochs']):
             with torch.no_grad():
                 for eb in eval_loader:
                     eb = {k: v.to(device) for k, v in eb.items()}
-                    with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+                    with torch.amp.autocast('cuda', dtype=DTYPE):
                         eo = model(input_ids=eb['input_ids'],
                                   attention_mask=eb['attention_mask'],
                                   labels=eb['labels'])
@@ -363,7 +382,7 @@ def evaluate(model, loader):
     with torch.no_grad():
         for batch in loader:
             batch = {k: v.to(device) for k, v in batch.items()}
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+            with torch.amp.autocast('cuda', dtype=DTYPE):
                 out = model(input_ids=batch['input_ids'],
                            attention_mask=batch['attention_mask'],
                            labels=batch['labels'])
@@ -409,7 +428,7 @@ with torch.no_grad():
     for bi, batch in enumerate(eval_loader):
         if bi >= 20: break
         batch = {k: v.to(device) for k, v in batch.items()}
-        with torch.amp.autocast('cuda', dtype=torch.bfloat16):
+        with torch.amp.autocast('cuda', dtype=DTYPE):
             out = model(input_ids=batch['input_ids'],
                        attention_mask=batch['attention_mask'],
                        labels=batch['labels'])
@@ -443,7 +462,7 @@ if all_scores_viz:
 # (c) 循环次数分布
 axes[2].hist(all_iters_viz, bins=range(1, cct_config.max_iter + 2),
              alpha=0.7, color='seagreen', align='left')
-axes[2].set_title('Iterations per Sample')
+axes[2].set_title('Iterations per Batch')
 axes[2].set_xlabel('num iterations')
 axes[2].set_xticks(range(1, cct_config.max_iter + 1))
 mean_iter = np.mean(all_iters_viz)
