@@ -149,8 +149,9 @@ CFG = {{
     'new_lr': 1e-4,
     'max_grad_norm': 1.0,
     'log_interval': 20,
-    'eval_interval': 200,
+    'eval_interval': 100,
     'max_samples': 40000,
+    'max_steps': 200,  # 调试: 只跑 200 步
 }}
 
 # === Tokenizer ===
@@ -292,12 +293,19 @@ def cells_train_loop() -> List[dict]:
 import time as _time
 model.train()
 _t0 = _time.time()
+max_steps = CFG.get('max_steps', total_steps)
+print('Training for %d steps (max_steps=%d, total_steps=%d)' % (
+    min(max_steps, total_steps), max_steps, total_steps))
 
+_stop = False
 for epoch in range(CFG['num_epochs']):
+    if _stop: break
     avg = {'total': 0, 'lm': 0, 'pred': 0, 'entropy': 0, 'ponder': 0, 'eff_iters': 0}
     avg_n = 0
 
     for bi, batch in enumerate(train_loader):
+        if gs >= max_steps:
+            _stop = True; break
         batch = {k: v.to(device) for k, v in batch.items()}
 
         # tau_halt 线性退火
@@ -329,10 +337,10 @@ for epoch in range(CFG['num_epochs']):
         if gs > 0 and gs % CFG['log_interval'] == 0 and (bi + 1) % CFG['grad_accum'] == 0:
             n = max(avg_n, 1)
             elapsed = _time.time() - _t0
-            eta_m = (elapsed / gs) * (total_steps - gs) / 60 if gs > 0 else 0
+            eta_m = (elapsed / gs) * (max_steps - gs) / 60 if gs > 0 else 0
             print('[Step %d/%d] loss=%.4f | lm=%.4f pred=%.4f ent=%.4f ponder=%.4f | '
                   'eff_iters=%.2f tau=%.3f | ETA %.0fm' % (
-                gs, total_steps, avg['total']/n, avg['lm']/n, avg['pred']/n,
+                gs, max_steps, avg['total']/n, avg['lm']/n, avg['pred']/n,
                 avg['entropy']/n, avg['ponder']/n, avg['eff_iters']/n, tau_halt, eta_m))
             avg = {'total': 0, 'lm': 0, 'pred': 0, 'entropy': 0, 'ponder': 0, 'eff_iters': 0}
             avg_n = 0
@@ -405,6 +413,66 @@ print('|----------|---------|--------|-----------|--------|')
 print('| Train    | %.4f  | %.2f | %.1f       | -      |' % (tl, tp, ti))
 print('| Infer    | %.4f  | %.2f | %.1f       | %+.4f |' % (il, ip, ii, il - tl))
 print('=' * 60)"""),
+    ]
+
+
+def cells_inference() -> List[dict]:
+    return [
+        md("## 4.5 推理测试: 用 eval 集问题生成回答"),
+        code("""\
+# === 4.5 推理: 从 eval 集抽 5 个问题，生成回答并对比 ground truth ===
+model.eval()
+
+# 简单贪心生成
+@torch.no_grad()
+def greedy_generate(model, input_ids, max_new_tokens=128):
+    \"\"\"手动贪心解码 (CCTLlamaModel 无 .generate())\"\"\"
+    ids = input_ids.clone()
+    for _ in range(max_new_tokens):
+        with torch.amp.autocast('cuda', dtype=DTYPE):
+            out = model(input_ids=ids)
+        next_id = out['logits'][:, -1, :].argmax(dim=-1, keepdim=True)
+        ids = torch.cat([ids, next_id], dim=1)
+        if next_id.item() == tokenizer.eos_token_id:
+            break
+    return ids
+
+# 从 eval 集随机抽 5 个样本
+import random
+random.seed(42)
+sample_indices = random.sample(range(len(eval_ds)), min(5, len(eval_ds)))
+
+print('=' * 80)
+print('推理测试: eval 集中抽取 %d 个问题' % len(sample_indices))
+print('=' * 80)
+
+for idx_i, si in enumerate(sample_indices):
+    text, prompt_len = eval_ds.data[si]
+    prompt_ids = tokenizer(text, truncation=True, max_length=CFG['max_seq_len'],
+                          add_special_tokens=False)['input_ids'][:prompt_len]
+    full_ids = tokenizer(text, truncation=True, max_length=CFG['max_seq_len'],
+                        add_special_tokens=False)['input_ids']
+    gt_ids = full_ids[prompt_len:]
+    gt_text = tokenizer.decode(gt_ids, skip_special_tokens=True)
+
+    input_tensor = torch.tensor([prompt_ids], device=device)
+    gen_ids = greedy_generate(model, input_tensor,
+                              max_new_tokens=min(256, len(gt_ids) + 50))
+    gen_text = tokenizer.decode(gen_ids[0][len(prompt_ids):], skip_special_tokens=True)
+    prompt_text = tokenizer.decode(prompt_ids, skip_special_tokens=True)
+
+    print('\\n--- Sample %d (eval idx=%d) ---' % (idx_i + 1, si))
+    print('[PROMPT] %s' % prompt_text[:300])
+    print('[GROUND TRUTH] %s' % gt_text[:500])
+    print('[MODEL OUTPUT] %s' % gen_text[:500])
+    match = gt_text.strip()[:100] == gen_text.strip()[:100]
+    print('[MATCH first 100 chars] %s' % ('YES ⚠️' if match else 'NO'))
+    print()
+
+print('=' * 80)
+print('如果 MODEL OUTPUT ≈ GROUND TRUTH，说明模型可能记住了训练分布')
+print('(注: eval 集是从同一个数据集 random_split 出来的，但训练时未见过)')
+print('=' * 80)"""),
     ]
 
 
@@ -508,6 +576,7 @@ def build_notebook() -> dict:
         cells_train_config,
         cells_train_loop,
         cells_eval,
+        cells_inference,
         cells_viz,
         cells_backup,
     ]:
