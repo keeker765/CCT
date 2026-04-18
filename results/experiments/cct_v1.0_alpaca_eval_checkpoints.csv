@@ -1,0 +1,4 @@
+step,eval_loss,eval_ppl,is_best
+200,0.1500,1.16,true
+400,0.1661,1.18,false
+600,0.1771,1.19,false
