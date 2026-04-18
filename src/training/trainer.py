@@ -120,13 +120,15 @@ class CCTTrainer:
             if self.global_step % getattr(self.config, "logging_steps", 10) == 0:
                 loss_dict = outputs.get("loss_dict", {})
                 num_iter = outputs.get("num_iterations", 0)
+                eff_iters = outputs.get("effective_iters", 0)
                 logger.info(
                     f"Step {self.global_step} | "
                     f"loss={loss_dict.get('loss_total', 0):.4f} | "
                     f"lm={loss_dict.get('loss_lm', 0):.4f} | "
                     f"pred={loss_dict.get('loss_pred', 0):.4f} | "
                     f"entropy={loss_dict.get('loss_entropy', 0):.4f} | "
-                    f"iters={num_iter} | τ_halt={tau_halt:.4f}"
+                    f"ponder={loss_dict.get('loss_ponder', 0):.4f} | "
+                    f"eff_iters={eff_iters:.2f} | τ_halt={tau_halt:.4f}"
                 )
 
             # 保存

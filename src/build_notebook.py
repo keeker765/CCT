@@ -229,6 +229,8 @@ cct_config = CCTConfig(
     max_iter=5,
     lambda_pred=0.1,
     lambda_entropy=0.01,
+    lambda_ponder=0.001,
+    use_ponder_cost=True,
     bf16=True,
     gradient_checkpointing=True,
 )
@@ -287,7 +289,7 @@ model.train()
 _t0 = _time.time()
 
 for epoch in range(CFG['num_epochs']):
-    avg = {'total': 0, 'lm': 0, 'pred': 0, 'entropy': 0, 'iters': 0}
+    avg = {'total': 0, 'lm': 0, 'pred': 0, 'entropy': 0, 'ponder': 0, 'eff_iters': 0}
     avg_n = 0
 
     for bi, batch in enumerate(train_loader):
@@ -315,18 +317,19 @@ for epoch in range(CFG['num_epochs']):
         avg['lm'] += ld.get('loss_lm', 0)
         avg['pred'] += ld.get('loss_pred', 0)
         avg['entropy'] += ld.get('loss_entropy', 0)
-        avg['iters'] += out.get('num_iterations', 0)
+        avg['ponder'] += ld.get('loss_ponder', 0)
+        avg['eff_iters'] += out.get('effective_iters', 0)
         avg_n += 1
 
         if gs > 0 and gs % CFG['log_interval'] == 0 and (bi + 1) % CFG['grad_accum'] == 0:
             n = max(avg_n, 1)
             elapsed = _time.time() - _t0
             eta_m = (elapsed / gs) * (total_steps - gs) / 60 if gs > 0 else 0
-            print('[Step %d/%d] loss=%.4f | lm=%.4f pred=%.4f ent=%.4f | '
-                  'iters=%.1f tau=%.3f | ETA %.0fm' % (
+            print('[Step %d/%d] loss=%.4f | lm=%.4f pred=%.4f ent=%.4f ponder=%.4f | '
+                  'eff_iters=%.2f tau=%.3f | ETA %.0fm' % (
                 gs, total_steps, avg['total']/n, avg['lm']/n, avg['pred']/n,
-                avg['entropy']/n, avg['iters']/n, tau_halt, eta_m))
-            avg = {'total': 0, 'lm': 0, 'pred': 0, 'entropy': 0, 'iters': 0}
+                avg['entropy']/n, avg['ponder']/n, avg['eff_iters']/n, tau_halt, eta_m))
+            avg = {'total': 0, 'lm': 0, 'pred': 0, 'entropy': 0, 'ponder': 0, 'eff_iters': 0}
             avg_n = 0
 
         if gs > 0 and gs % CFG['eval_interval'] == 0 and (bi + 1) % CFG['grad_accum'] == 0:

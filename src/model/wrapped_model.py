@@ -368,8 +368,24 @@ class CCTLlamaModel(nn.Module):
                 remainders=remainders_list,
                 lambda_pred=self.config.lambda_pred,
                 lambda_entropy=self.config.lambda_entropy,
+                lambda_ponder=self.config.lambda_ponder,
+                use_ponder_cost=self.config.use_ponder_cost,
                 valid_mask=valid_mask,
             )
+
+        # 计算 effective_iters (期望迭代数, 用于日志)
+        effective_iters = 0.0
+        if p_halts:
+            with torch.no_grad():
+                eff = torch.zeros_like(p_halts[0])
+                for k, (ph, rm) in enumerate(zip(p_halts, remainders_list)):
+                    eff = eff + (k + 1) * rm * ph
+                if remainders_list:
+                    eff = eff + len(p_halts) * remainders_list[-1] * (1.0 - p_halts[-1])
+                if valid_mask is not None:
+                    effective_iters = (eff * valid_mask).sum().item() / max(valid_mask.sum().item(), 1)
+                else:
+                    effective_iters = eff.mean().item()
 
         return {
             "loss": loss,
@@ -378,6 +394,7 @@ class CCTLlamaModel(nn.Module):
             "p_halts": p_halts,
             "scores": all_scores,
             "num_iterations": len(all_scores),
+            "effective_iters": effective_iters,
         }
 
     def set_halt_tau(self, tau: float):
