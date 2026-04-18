@@ -44,7 +44,7 @@ class CCTConfig:
 
     # 损失权重
     lambda_pred: float = 0.1
-    lambda_entropy: float = 0.01  # halting 熵正则 (最小化 → 锐利停止决策)
+    lambda_entropy: float = 0.0  # 已关闭: L_entropy 过早推动 p_halt 二值化，τ退火已足够
     lambda_ponder: float = 0.0  # ponder cost (已关闭: eff_iters→1 过快)
     use_ponder_cost: bool = False  # 开关: 关闭 L_ponder 以避免压制迭代
 
