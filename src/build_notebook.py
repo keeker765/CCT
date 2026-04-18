@@ -80,27 +80,16 @@ def cells_download() -> List[dict]:
         code(f"""\
 # === 1. 从 GitHub 克隆代码 ===
 import os, subprocess
-from getpass import getpass
 
 WORK_DIR = "/content/CCT"
 MODEL_NAME = "{MODEL_NAME}"
-
-# 仓库是 private, 需要 GitHub PAT
-# GitHub Settings -> Developer settings -> Personal access tokens -> Generate
-GH_TOKEN = getpass("GitHub PAT (repo scope): ")
-REPO_URL = f"https://{{GH_TOKEN}}@github.com/{GH_REPO}.git"
 
 if os.path.exists(WORK_DIR):
     print("目录已存在, 执行 git pull...")
     subprocess.run(["git", "-C", WORK_DIR, "pull"], check=True)
 else:
-    print("克隆私有仓库...")
-    subprocess.run(["git", "clone", REPO_URL, WORK_DIR], check=True)
-
-# 安全: 清除 remote URL 中的 PAT, 防止泄露
-subprocess.run(["git", "-C", WORK_DIR, "remote", "set-url", "origin",
-                "https://github.com/{GH_REPO}.git"], check=False)
-del GH_TOKEN, REPO_URL
+    print("克隆仓库...")
+    subprocess.run(["git", "clone", "https://github.com/{GH_REPO}.git", WORK_DIR], check=True)
 
 os.chdir(WORK_DIR)
 print("CWD: %s" % os.getcwd())
@@ -222,26 +211,14 @@ eval_sz = int(len(full_ds) * 0.05)
 train_ds, eval_ds = random_split(full_ds, [len(full_ds) - eval_sz, eval_sz])
 print('Train: %d, Eval: %d' % (len(train_ds), len(eval_ds)))
 
-# === GPU 检测 + dtype 选择 ===
-assert torch.cuda.is_available(), 'Need GPU!'
-USE_BF16 = torch.cuda.is_bf16_supported()
-DTYPE = torch.bfloat16 if USE_BF16 else torch.float16
-print('GPU: %s, VRAM: %.1f GB, dtype: %s' % (
-    torch.cuda.get_device_name(), torch.cuda.get_device_properties(0).total_mem / 1e9,
-    'bf16' if USE_BF16 else 'fp16'))
-
-# 小显存自动降 batch_size
-vram_gb = torch.cuda.get_device_properties(0).total_mem / 1e9
-if vram_gb < 20 and CFG['batch_size'] > 8:
-    CFG['batch_size'] = 8
-    print('VRAM < 20GB, batch_size 降至 %d' % CFG['batch_size'])
-
 # === 模型 ===
+DTYPE = torch.bfloat16
+
 cct_config = CCTConfig(
     max_iter=5,
     lambda_pred=0.1,
     lambda_flops=0.01,
-    bf16=USE_BF16,
+    bf16=True,
     gradient_checkpointing=True,
 )
 
