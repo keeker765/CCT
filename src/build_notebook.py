@@ -151,7 +151,7 @@ CFG = {{
     'log_interval': 20,
     'eval_interval': 100,
     'max_samples': 40000,
-    'max_steps': 200,  # 调试: 只跑 200 步
+    'max_steps': 100,  # 调试: 只跑 100 步
 }}
 
 # === Tokenizer ===
