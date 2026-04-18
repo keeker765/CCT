@@ -35,6 +35,9 @@ class CCTConfig:
     lambda_precision_init: float = 1.0
     precision_temperature: float = 0.5  # 固定超参数
 
+    # Predictor
+    info_dim: int = 256  # info_proj 降维维度 (与 PPG 一致)
+
     # HaltHead 退火温度
     halt_tau_start: float = 1.0
     halt_tau_end: float = 0.01

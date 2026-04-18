@@ -30,7 +30,7 @@ except ImportError:
 from .column_config import CCTConfig
 from .cct_decoder_layer import CCTDecoderLayer
 from .cycle_embedding import RotaryCycleEmbedding
-from .predictor import Predictor, AnchorMLP, compute_score, compute_pred_loss
+from .predictor import CCTPredictor
 from .l6_precision import L6Precision
 from .halt_head import HaltHead
 from .losses import compute_lm_loss, compute_total_loss
@@ -100,8 +100,7 @@ class CCTLlamaModel(nn.Module):
             self.back_layers.append(base_model.model.layers[src_idx])
 
         # === CCT 新增模块 ===
-        self.predictor = Predictor(config.d_model)
-        self.anchor_mlp = AnchorMLP(config.d_model)
+        self.cct_predictor = CCTPredictor(config.d_model, config.info_dim)
         self.l6_precision = L6Precision(
             lambda_init=config.lambda_precision_init,
             temperature=config.precision_temperature,
@@ -125,8 +124,7 @@ class CCTLlamaModel(nn.Module):
 
         # 将新模块转换为与基座相同的 dtype
         base_dtype = self._model_dtype
-        self.predictor.to(base_dtype)
-        self.anchor_mlp.to(base_dtype)
+        self.cct_predictor.to(base_dtype)
         self.l6_precision.to(base_dtype)
         self.halt_head.to(base_dtype)
         self.inter_iter_norm.to(base_dtype)
@@ -273,16 +271,12 @@ class CCTLlamaModel(nn.Module):
                 # e. 更新 remainder
                 remainder = remainder * (1.0 - p_halt)
 
-                # f. Predictor + AnchorMLP + score
-                pred = self.predictor(h)
-                anchor = self.anchor_mlp(x_column)
-                score = compute_score(pred, anchor, self.config.d_model)
+                # f. Score (双重 detach, 共享 info_proj)
+                score = self.cct_predictor.compute_score(h, x_column)
                 all_scores.append(score)
 
-                # g. L_pred
-                l_pred_k = compute_pred_loss(
-                    self.predictor, self.anchor_mlp, h, x_column
-                )
+                # g. L_pred (双重 detach 防崩塌)
+                l_pred_k = self.cct_predictor.compute_pred_loss(h, x_column)
                 pred_losses.append(l_pred_k)
 
                 # h. 提前退出优化 (remainder 极小时无意义继续)
@@ -315,9 +309,7 @@ class CCTLlamaModel(nn.Module):
                 p_halt = self.halt_head(h, tau_halt)
 
                 # Score for precision
-                pred = self.predictor(h)
-                anchor = self.anchor_mlp(x_column)
-                score = compute_score(pred, anchor, self.config.d_model)
+                score = self.cct_predictor.compute_score(h, x_column)
                 all_scores.append(score)
 
                 if k >= self.config.min_iter - 1 and p_halt.mean().item() > 0.5:
@@ -367,7 +359,7 @@ class CCTLlamaModel(nn.Module):
     def get_param_groups(self) -> List[dict]:
         """返回分层学习率参数组"""
         new_modules = [
-            self.predictor, self.anchor_mlp, self.l6_precision,
+            self.cct_predictor, self.l6_precision,
             self.halt_head, self.inter_iter_norm,
         ]
         new_params = set()
@@ -392,7 +384,7 @@ class CCTLlamaModel(nn.Module):
         total = sum(p.numel() for p in self.parameters())
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         cct_modules = [
-            self.predictor, self.anchor_mlp, self.l6_precision,
+            self.cct_predictor, self.l6_precision,
             self.halt_head, self.inter_iter_norm,
         ]
         cct_params = sum(
