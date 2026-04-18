@@ -51,7 +51,7 @@ def cells_header() -> List[dict]:
 
 **目的**: 与 CCT 实验公平对比
 - 相同 base model: `{MODEL_NAME}`
-- 相同数据集: Alpaca (40k samples, 512 max_length)
+- 相同数据集: OpenHermes 2.5 (40k samples, 512 max_length)
 - 相同学习率: 2e-5
 - 相同训练配置: 1 epoch, batch_size=32, AdamW, cosine LR
 - **无 CCT Column 循环** — 直接 full fine-tuning all 16 layers"""),
@@ -117,7 +117,7 @@ if tokenizer.chat_template is None:
     tokenizer.chat_template = LLAMA3_CHAT_TEMPLATE
     print('已手动设置 Llama 3 chat template')
 
-# === 数据集 (Alpaca SFT) — 与 CCT notebook 完全一致 ===
+# === 数据集 (OpenHermes 2.5 — ShareGPT 格式, 与 CCT notebook 完全一致) ===
 class SFTDataset(Dataset):
     def __init__(self, dataset, tokenizer, max_length=512, max_samples=None):
         self.tokenizer = tokenizer
@@ -125,23 +125,28 @@ class SFTDataset(Dataset):
         self.data = []
         for i, ex in enumerate(dataset):
             if max_samples and i >= max_samples: break
-            if 'instruction' in ex:
-                user_msg = ex['instruction']
-                inp = ex.get('input', '').strip()
-                if inp:
-                    user_msg += '\\n\\n' + inp
-                prompt_msgs = [{{'role': 'user', 'content': user_msg}}]
-                full_msgs = prompt_msgs + [{{'role': 'assistant', 'content': ex.get('output', '')}}]
-                prompt_text = tokenizer.apply_chat_template(
-                    prompt_msgs, tokenize=False, add_generation_prompt=True)
-                full_text = tokenizer.apply_chat_template(
-                    full_msgs, tokenize=False, add_generation_prompt=False)
-                prompt_len = len(tokenizer(prompt_text, add_special_tokens=False)['input_ids'])
-                self.data.append((full_text, prompt_len))
-            elif 'text' in ex:
-                self.data.append((ex['text'], 0))
-            else:
-                continue
+            convs = ex.get('conversations', [])
+            if not convs: continue
+            user_parts, gpt_parts = [], []
+            for turn in convs:
+                role = turn.get('from', '')
+                val = turn.get('value', '').strip()
+                if not val: continue
+                if role == 'human':
+                    user_parts.append(val)
+                elif role == 'gpt':
+                    gpt_parts.append(val)
+            if not user_parts or not gpt_parts: continue
+            user_msg = '\\n\\n'.join(user_parts)
+            gpt_msg = '\\n\\n'.join(gpt_parts)
+            prompt_msgs = [{{'role': 'user', 'content': user_msg}}]
+            full_msgs = prompt_msgs + [{{'role': 'assistant', 'content': gpt_msg}}]
+            prompt_text = tokenizer.apply_chat_template(
+                prompt_msgs, tokenize=False, add_generation_prompt=True)
+            full_text = tokenizer.apply_chat_template(
+                full_msgs, tokenize=False, add_generation_prompt=False)
+            prompt_len = len(tokenizer(prompt_text, add_special_tokens=False)['input_ids'])
+            self.data.append((full_text, prompt_len))
     def __len__(self): return len(self.data)
     def __getitem__(self, idx):
         text, prompt_len = self.data[idx]
@@ -156,7 +161,8 @@ class SFTDataset(Dataset):
             labels[:prompt_len] = -100
         return {{'input_ids': input_ids, 'attention_mask': attn, 'labels': labels}}
 
-raw = load_dataset('tatsu-lab/alpaca', split='train')
+raw = load_dataset('teknium/OpenHermes-2.5', split='train')
+print('OpenHermes 2.5 总量: %d' % len(raw))
 full_ds = SFTDataset(raw, tokenizer, max_length=512, max_samples=CFG['max_samples'])
 eval_sz = int(len(full_ds) * 0.05)
 train_ds, eval_ds = random_split(full_ds, [len(full_ds) - eval_sz, eval_sz])
