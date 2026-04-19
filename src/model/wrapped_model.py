@@ -466,16 +466,24 @@ class CCTLlamaModel(nn.Module):
                 valid_mask=valid_mask,
             )
 
-        # 报告最后一次迭代的平均 entropy (仅有效 token)
+        # 报告最后一次迭代的 entropy 统计 (仅有效 token)
         mean_entropy = 0.0
+        std_entropy = 0.0
         if all_entropies:
             with torch.no_grad():
                 last_h = all_entropies[-1]
                 if attention_mask is not None:
                     valid = attention_mask[:, :seq_len].bool()
-                    mean_entropy = last_h[valid].mean().item() if valid.any() else last_h.mean().item()
+                    if valid.any():
+                        valid_h = last_h[valid]
+                        mean_entropy = valid_h.mean().item()
+                        std_entropy = valid_h.std().item() if valid_h.numel() > 1 else 0.0
+                    else:
+                        mean_entropy = last_h.mean().item()
+                        std_entropy = last_h.std().item()
                 else:
                     mean_entropy = last_h.mean().item()
+                    std_entropy = last_h.std().item()
 
         return {
             "loss": loss,
@@ -483,12 +491,34 @@ class CCTLlamaModel(nn.Module):
             "loss_dict": loss_dict,
             "num_iterations": num_iters_executed,
             "mean_entropy": mean_entropy,
+            "std_entropy": std_entropy,
             "entropies": [e.detach() for e in all_entropies],
         }
 
     def fold_fusions(self):
         """折叠所有 FusionLinear → 普通 Linear (零推理开销)"""
         fold_all_fusions(self)
+
+    def get_fusion_magnitudes(self) -> Dict[str, float]:
+        """返回各层 FusionLinear 的融合量 ||A @ B^T||_F / ||W_pruned||_F
+
+        Returns:
+            dict: {层名: 融合比例}, 例如 {"col.0.q_proj": 0.032, ...}
+        """
+        result = {}
+        for name, module in self.named_modules():
+            if isinstance(module, FusionLinear) and not module._folded:
+                with torch.no_grad():
+                    ab = module.A @ module.B.T  # (d_out, d_in)
+                    fusion_norm = ab.norm().item()
+                    pruned_norm = module.W_pruned.norm().item()
+                    ratio = fusion_norm / max(pruned_norm, 1e-8)
+                    short_name = name.replace("column_layers.", "col.").replace(
+                        "front_layers.", "front.").replace(
+                        "back_layers.", "back.").replace(
+                        "self_attn.", "").replace("mlp.", "")
+                    result[short_name] = ratio
+        return result
 
     def set_halt_threshold(self, threshold: float):
         """动态设置推理 halt 阈值 (用于退火)"""
