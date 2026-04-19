@@ -252,9 +252,16 @@ del base; gc.collect(); torch.cuda.empty_cache()
 model.enable_gradient_checkpointing()
 device = torch.device('cuda')
 model = model.to(device)
+
+# 加速设置
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.set_float32_matmul_precision('high')
+
 print(model.get_trainable_params_info())
 print('Column layers: %d, Max iter: %d, seq_len: %d' % (
-    len(cct_config.pretrained_column_layers), cct_config.max_iter, CFG['max_seq_len']))"""),
+    len(cct_config.pretrained_column_layers), cct_config.max_iter, CFG['max_seq_len']))
+print('SDPA enabled, TF32 matmul enabled')"""),
     ]
 
 

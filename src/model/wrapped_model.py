@@ -275,6 +275,10 @@ class CCTLlamaModel(nn.Module):
         x_column = hidden_states  # 保存 Column 输入
         h = hidden_states
 
+        # Column 层 SDPA 优化: 无 padding 时传 None mask → is_causal=True (Flash Attention)
+        has_padding = attention_mask is not None and (attention_mask == 0).any()
+        column_mask = layer_kwargs.get("attention_mask") if has_padding else None
+
         tau_halt = self.halt_tau.item()
         pred_losses: List[torch.Tensor] = []
         p_halts: List[torch.Tensor] = []
@@ -313,7 +317,7 @@ class CCTLlamaModel(nn.Module):
                     if self._gradient_checkpointing:
                         h = torch.utils.checkpoint.checkpoint(
                             col_layer, h.to(self._model_dtype),
-                            layer_kwargs.get("attention_mask"),
+                            column_mask,
                             position_ids,
                             None,  # past_key_values
                             position_embeddings,
@@ -324,7 +328,7 @@ class CCTLlamaModel(nn.Module):
                     else:
                         h = col_layer(
                             h.to(self._model_dtype),
-                            attention_mask=layer_kwargs.get("attention_mask"),
+                            attention_mask=column_mask,
                             position_ids=position_ids,
                             position_embeddings=position_embeddings,
                             cycle_k=col_cycle_k,
@@ -392,7 +396,7 @@ class CCTLlamaModel(nn.Module):
                     col_precision = precision_bias if ci == 0 else None
                     h = col_layer(
                         h.to(self._model_dtype),
-                        attention_mask=layer_kwargs.get("attention_mask"),
+                        attention_mask=column_mask,
                         position_ids=position_ids,
                         position_embeddings=position_embeddings,
                         cycle_k=col_cycle_k,
