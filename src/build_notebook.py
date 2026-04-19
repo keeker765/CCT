@@ -505,19 +505,30 @@ import numpy as np
 
 model.eval()
 all_scores_viz = []
-all_iters_viz = []
+all_eff_iters_viz = []  # per-token effective iterations
 
 with torch.no_grad():
     for bi, batch in enumerate(eval_loader):
         if bi >= 20: break
-        batch = {k: v.to(device) for k, v in batch.items()}
+        batch = {{k: v.to(device) for k, v in batch.items()}}
         with torch.amp.autocast('cuda', dtype=DTYPE):
             out = model(input_ids=batch['input_ids'],
                        attention_mask=batch['attention_mask'],
                        labels=batch['labels'])
         if out['scores']:
             all_scores_viz.append(out['scores'][-1].float().cpu())
-        all_iters_viz.append(out['num_iterations'])
+        # 从 p_halts 重建 per-token effective iterations
+        if out['p_halts']:
+            p_halts_cpu = [ph.float().cpu() for ph in out['p_halts']]
+            remainder = torch.ones_like(p_halts_cpu[0])
+            eff = torch.zeros_like(p_halts_cpu[0])
+            for k, ph in enumerate(p_halts_cpu):
+                eff += (k + 1) * remainder * ph
+                remainder = remainder * (1.0 - ph)
+            eff += len(p_halts_cpu) * remainder  # 剩余分配给最后一轮
+            mask = batch['attention_mask'][:, :eff.size(1)].cpu()
+            eff_tokens = eff[mask.bool()].numpy()
+            all_eff_iters_viz.append(eff_tokens)
 
 fig, axes = plt.subplots(1, 3, figsize=(15, 4))
 
@@ -526,7 +537,7 @@ if all_scores_viz:
     scores_flat = torch.cat(all_scores_viz).flatten().numpy()
     axes[0].hist(scores_flat, bins=50, alpha=0.7, color='steelblue')
     axes[0].set_title('Prediction Score Distribution')
-    axes[0].set_xlabel('score (pred . anchor / sqrt(d))')
+    axes[0].set_xlabel('cosine similarity')
     axes[0].axvline(x=np.mean(scores_flat), color='red', ls='--',
                     label='mean=%.3f' % np.mean(scores_flat))
     axes[0].legend()
@@ -542,16 +553,17 @@ if all_scores_viz:
                     label='mean=%.3f' % np.mean(precision))
     axes[1].legend()
 
-# (c) 循环次数分布
-axes[2].hist(all_iters_viz, bins=range(1, cct_config.max_iter + 2),
-             alpha=0.7, color='seagreen', align='left')
-axes[2].set_title('Iterations per Batch')
-axes[2].set_xlabel('num iterations')
-axes[2].set_xticks(range(1, cct_config.max_iter + 1))
-mean_iter = np.mean(all_iters_viz)
-axes[2].axvline(x=mean_iter, color='red', ls='--',
-                label='mean=%.1f' % mean_iter)
-axes[2].legend()
+# (c) Per-token Effective Iterations 分布
+if all_eff_iters_viz:
+    eff_flat = np.concatenate(all_eff_iters_viz)
+    axes[2].hist(eff_flat, bins=50, alpha=0.7, color='seagreen')
+    axes[2].set_title('Per-Token Effective Iterations (N=%d)' % len(eff_flat))
+    axes[2].set_xlabel('effective iterations')
+    mean_eff = np.mean(eff_flat)
+    std_eff = np.std(eff_flat)
+    axes[2].axvline(x=mean_eff, color='red', ls='--',
+                    label='mean=%.2f±%.2f' % (mean_eff, std_eff))
+    axes[2].legend()
 
 plt.tight_layout()
 plt.savefig('output/cct/viz_distributions.png', dpi=150)
