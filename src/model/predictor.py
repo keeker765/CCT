@@ -1,21 +1,17 @@
-"""CCT Predictor — 前向预测 (predict column residual Δ)
+"""CCT Predictor — 前向预测 (predict column residual Δ, 低容量版)
 
 设计:
-  predictor 预测的是 column 变换的 **残差** delta = h_curr - h_prev,
-  而不是 h_curr 本身。
+  predictor 直接从 d_model 空间映射到 info_dim (单层),
+  去掉了 info_proj 共享投影, 降低 predictor 容量防止塌缩。
 
-为什么预测残差:
-  column 层含 residual connection → h_curr ≈ h_prev + δ
-  直接比较 h_prev 和 h_curr 的 cosine similarity 天然接近 1
-  → score 饱和 → L6 Precision 无法区分 token
-  预测 δ 后, 预测难度取决于 column 变换的非线性部分,
-  token-dependent 方差更大, score 分布更展开。
+  目标侧使用冻结随机投影 (target_proj), 不参与优化。
+  predictor 无法通过联合优化投影空间来降低任务难度。
 
 梯度流向:
-  预测侧: h_prev.detach() → info_proj → predictor → z_pred
-           ✓ info_proj + predictor 获得梯度
-  目标侧: delta.detach() → info_proj → z_anchor.detach()
-           ✗ 双重 detach 防止共享投影坍缩
+  预测侧: h_prev.detach() → predictor(d_model→info_dim) → z_pred
+           ✓ predictor 获得梯度
+  目标侧: delta.detach() → target_proj(冻结) → z_anchor.detach()
+           ✗ 完全无梯度
 """
 
 import torch
@@ -27,32 +23,26 @@ import math
 class CCTPredictor(nn.Module):
     """前向预测器: predict column residual from pre-column state
 
-    info_proj: Linear(d_model → info_dim, bias=False) — 共享投影
-    predictor: Linear(info_dim → info_dim) — 预测 head
+    predictor:   Linear(d_model → info_dim) — 直接映射, 单层
+    target_proj: Linear(d_model → info_dim) — 冻结随机投影
     """
 
     def __init__(self, d_model: int, info_dim: int = 256):
         super().__init__()
         self.info_dim = info_dim
-        self.info_proj = nn.Linear(d_model, info_dim, bias=False)
-        self.predictor = nn.Linear(info_dim, info_dim)
-
-    def project(self, x: torch.Tensor) -> torch.Tensor:
-        """投影到 info 空间 (用于 anchor/target)"""
-        return self.info_proj(x.to(self.info_proj.weight.dtype))
+        self.predictor = nn.Linear(d_model, info_dim)
+        # 冻结随机投影: delta → info_dim (不可训练)
+        self.target_proj = nn.Linear(d_model, info_dim, bias=False)
+        self.target_proj.weight.requires_grad_(False)
 
     def predict(self, h_prev: torch.Tensor) -> torch.Tensor:
-        """预测 column 残差的 info 表征"""
-        z = self.project(h_prev)
-        return self.predictor(z)
+        """从 h_prev 直接预测 delta 的投影"""
+        return self.predictor(h_prev.to(self.predictor.weight.dtype))
 
     def compute_pred_loss(
         self, h_prev: torch.Tensor, h_curr: torch.Tensor
     ) -> torch.Tensor:
         """L_pred: 预测列变换残差的准确度
-
-        prediction = predictor(info_proj(h_prev.detach()))
-        z_anchor = info_proj((h_curr - h_prev).detach()).detach()
 
         Args:
             h_prev: [B, T, D] — 列运算前
@@ -62,7 +52,9 @@ class CCTPredictor(nn.Module):
         """
         delta = (h_curr - h_prev).detach()
         z_pred = self.predict(h_prev.detach())
-        z_anchor = self.project(delta).detach()
+        z_anchor = self.target_proj(
+            delta.to(self.target_proj.weight.dtype)
+        ).detach()
         cos_sim = F.cosine_similarity(
             z_pred.float(), z_anchor.float(), dim=-1
         )
@@ -84,6 +76,8 @@ class CCTPredictor(nn.Module):
         """
         delta = (h_curr - h_prev).detach()
         z_pred = self.predict(h_prev).detach()
-        z_anchor = self.project(delta).detach()
+        z_anchor = self.target_proj(
+            delta.to(self.target_proj.weight.dtype)
+        ).detach()
         score = F.cosine_similarity(z_pred.float(), z_anchor.float(), dim=-1)
         return score
