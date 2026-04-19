@@ -305,7 +305,7 @@ print('模型就绪 ✓')"""),
         code(f"""\
 # === 训练 ({max_steps} 步测试) ===
 from torch.optim import AdamW
-from src.training.scheduler import get_cosine_schedule_with_warmup
+from src.training.scheduler import get_cosine_schedule_with_warmup, compute_halt_threshold
 
 param_groups = model.get_param_groups()
 param_groups[0]['lr'] = CFG['lr']

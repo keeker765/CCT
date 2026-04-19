@@ -490,6 +490,10 @@ class CCTLlamaModel(nn.Module):
         """折叠所有 FusionLinear → 普通 Linear (零推理开销)"""
         fold_all_fusions(self)
 
+    def set_halt_threshold(self, threshold: float):
+        """动态设置推理 halt 阈值 (用于退火)"""
+        self.config.halt_entropy_threshold = threshold
+
     def enable_gradient_checkpointing(self):
         self._gradient_checkpointing = True
 

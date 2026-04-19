@@ -235,7 +235,7 @@ from torch.utils.data import DataLoader, Dataset, random_split
 
 from src.model.wrapped_model import CCTLlamaModel
 from src.model.column_config import CCTConfig
-from src.training.scheduler import get_cosine_schedule_with_warmup
+from src.training.scheduler import get_cosine_schedule_with_warmup, compute_halt_threshold
 
 # === 超参数 ===
 CFG = {
@@ -796,8 +796,13 @@ if train_files is not None:
 
         # === 定期 Eval ===
         if (gs + 1) % CFG['eval_interval'] == 0:
+            # 退火 halt 阈值
+            halt_th = compute_halt_threshold(gs + 1, max_steps,
+                                             cct_config.halt_threshold_start,
+                                             cct_config.halt_threshold_end)
+            model.set_halt_threshold(halt_th)
             model.eval()
-            ev_loss, ev_n = 0, 0
+            ev_loss, ev_n, ev_ent, ev_iters = 0, 0, 0, 0
             with torch.no_grad():
                 for eb in eval_loader:
                     eb = {k: v.to(device) for k, v in eb.items()}
@@ -805,10 +810,16 @@ if train_files is not None:
                         eo = model(input_ids=eb['input_ids'],
                                   attention_mask=eb['attention_mask'],
                                   labels=eb['labels'])
-                    ev_loss += eo['loss_dict'].get('loss_lm', 0); ev_n += 1
+                    ev_loss += eo['loss_dict'].get('loss_lm', 0)
+                    ev_ent += eo.get('mean_entropy', 0)
+                    ev_iters += eo.get('num_iterations', 0)
+                    ev_n += 1
             avg_ev = ev_loss / max(ev_n, 1)
             ppl = math.exp(min(avg_ev, 20))
-            print('  [Eval step %d] loss=%.4f PPL=%.2f' % (gs + 1, avg_ev, ppl))
+            avg_ev_ent = ev_ent / max(ev_n, 1)
+            avg_ev_iters = ev_iters / max(ev_n, 1)
+            print('  [Eval step %d] loss=%.4f PPL=%.2f H=%.3f iters=%.1f th=%.3f' % (
+                gs + 1, avg_ev, ppl, avg_ev_ent, avg_ev_iters, halt_th))
             if avg_ev < best_eval:
                 best_eval = avg_ev
                 torch.save(model.state_dict(), '/kaggle/working/output/best_model.pt')
@@ -871,8 +882,12 @@ else:
                     _timeout_exit = True
                     break
                 if gs_count % CFG['eval_interval'] == 0:
+                    halt_th = compute_halt_threshold(gs_count, max_steps,
+                                                     cct_config.halt_threshold_start,
+                                                     cct_config.halt_threshold_end)
+                    model.set_halt_threshold(halt_th)
                     model.eval()
-                    ev_loss, ev_n = 0, 0
+                    ev_loss, ev_n, ev_ent, ev_iters = 0, 0, 0, 0
                     with torch.no_grad():
                         for eb in eval_loader:
                             eb = {k: v.to(device) for k, v in eb.items()}
@@ -880,10 +895,16 @@ else:
                                 eo = model(input_ids=eb['input_ids'],
                                           attention_mask=eb['attention_mask'],
                                           labels=eb['labels'])
-                            ev_loss += eo['loss_dict'].get('loss_lm', 0); ev_n += 1
+                            ev_loss += eo['loss_dict'].get('loss_lm', 0)
+                            ev_ent += eo.get('mean_entropy', 0)
+                            ev_iters += eo.get('num_iterations', 0)
+                            ev_n += 1
                     avg_ev = ev_loss / max(ev_n, 1)
                     ppl = math.exp(min(avg_ev, 20))
-                    print('  [Eval] loss=%.4f PPL=%.2f' % (avg_ev, ppl))
+                    avg_ev_ent = ev_ent / max(ev_n, 1)
+                    avg_ev_iters = ev_iters / max(ev_n, 1)
+                    print('  [Eval] loss=%.4f PPL=%.2f H=%.3f iters=%.1f th=%.3f' % (
+                        avg_ev, ppl, avg_ev_ent, avg_ev_iters, halt_th))
                     if avg_ev < best_eval:
                         best_eval = avg_ev
                         torch.save(model.state_dict(), '/kaggle/working/output/best_model.pt')
