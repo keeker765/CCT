@@ -44,7 +44,7 @@ class L6Precision(nn.Module):
 
         # Halt 参数: score → 停止决策
         self._halt_gain = nn.Parameter(torch.tensor(1.0))   # softplus 保证 > 0
-        self.halt_bias = nn.Parameter(torch.tensor(0.0))     # 仿射偏移
+        self.halt_bias = nn.Parameter(torch.tensor(-2.0))    # 初始偏低, 鼓励多迭代
 
     def compute_attention_bias(self, score: torch.Tensor) -> torch.Tensor:
         """Score → attention 增益调制 (用于 column layers)
