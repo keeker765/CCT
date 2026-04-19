@@ -466,28 +466,21 @@ class CCTLlamaModel(nn.Module):
                 valid_mask=valid_mask,
             )
 
-        # 报告每次迭代的 mean entropy (仅有效 token)
+        # 报告最后一次迭代的 entropy 统计 (仅有效 token)
         mean_entropy = 0.0
         std_entropy = 0.0
-        per_iter_entropy = []
         if all_entropies:
             with torch.no_grad():
-                valid = None
+                last_h = all_entropies[-1]
                 if attention_mask is not None:
                     valid = attention_mask[:, :seq_len].bool()
-
-                for h_k in all_entropies:
-                    if valid is not None and valid.any():
-                        per_iter_entropy.append(h_k[valid].mean().item())
+                    if valid.any():
+                        valid_h = last_h[valid]
+                        mean_entropy = valid_h.mean().item()
+                        std_entropy = valid_h.std().item() if valid_h.numel() > 1 else 0.0
                     else:
-                        per_iter_entropy.append(h_k.mean().item())
-
-                # 最后一次迭代的统计
-                last_h = all_entropies[-1]
-                if valid is not None and valid.any():
-                    valid_h = last_h[valid]
-                    mean_entropy = valid_h.mean().item()
-                    std_entropy = valid_h.std().item() if valid_h.numel() > 1 else 0.0
+                        mean_entropy = last_h.mean().item()
+                        std_entropy = last_h.std().item()
                 else:
                     mean_entropy = last_h.mean().item()
                     std_entropy = last_h.std().item()
@@ -499,7 +492,6 @@ class CCTLlamaModel(nn.Module):
             "num_iterations": num_iters_executed,
             "mean_entropy": mean_entropy,
             "std_entropy": std_entropy,
-            "per_iter_entropy": per_iter_entropy,
             "entropies": [e.detach() for e in all_entropies],
         }
 

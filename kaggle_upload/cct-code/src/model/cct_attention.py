@@ -1,0 +1,145 @@
+"""CCTAttention — 改造自 LlamaAttention, 内置循环嵌入 + entropy temperature
+
+复制 LlamaAttention 源码, 新增:
+1. 旋转循环嵌入 (CycleEmbed): Q/K 投影前施加 → 保留循环信息
+2. Entropy temperature: 基于输出 entropy 的 per-query 温度调制
+3. SDPA 加速: 使用 F.scaled_dot_product_attention 替代手动 matmul
+
+每层双重旋转操作:
+  CycleEmbed(φ=1.618, 投影前) + 标准 RoPE(投影后)
+"""
+
+import math
+from typing import Optional, Tuple
+
+import torch
+from torch import nn
+import torch.nn.functional as F
+
+from transformers.cache_utils import Cache
+from transformers.models.llama.modeling_llama import (
+    apply_rotary_pos_emb,
+    repeat_kv,
+    LlamaConfig,
+)
+
+from .cycle_embedding import RotaryCycleEmbedding
+
+
+class CCTAttention(nn.Module):
+    """CCT Attention — 在 LlamaAttention 基础上新增循环嵌入和 entropy temperature"""
+
+    def __init__(
+        self,
+        config: LlamaConfig,
+        layer_idx: int,
+        cycle_embedding: RotaryCycleEmbedding,
+    ):
+        super().__init__()
+        self.config = config
+        self.layer_idx = layer_idx
+        self.cycle_embedding = cycle_embedding
+
+        self.head_dim = getattr(
+            config, "head_dim", config.hidden_size // config.num_attention_heads
+        )
+        self.num_key_value_groups = (
+            config.num_attention_heads // config.num_key_value_heads
+        )
+        self.scaling = self.head_dim ** -0.5
+        self.attention_dropout = config.attention_dropout
+        self.is_causal = True
+
+        self.q_proj = nn.Linear(
+            config.hidden_size,
+            config.num_attention_heads * self.head_dim,
+            bias=config.attention_bias,
+        )
+        self.k_proj = nn.Linear(
+            config.hidden_size,
+            config.num_key_value_heads * self.head_dim,
+            bias=config.attention_bias,
+        )
+        self.v_proj = nn.Linear(
+            config.hidden_size,
+            config.num_key_value_heads * self.head_dim,
+            bias=config.attention_bias,
+        )
+        self.o_proj = nn.Linear(
+            config.num_attention_heads * self.head_dim,
+            config.hidden_size,
+            bias=config.attention_bias,
+        )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        past_key_values: Optional[Cache] = None,
+        cycle_k: int = 0,
+        precision_bias: Optional[torch.Tensor] = None,  # DEPRECATED
+        entropy_temperature: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        input_shape = hidden_states.shape[:-1]
+        hidden_shape = (*input_shape, -1, self.head_dim)
+
+        # Q/K 投影前施加旋转循环嵌入
+        if cycle_k > 0:
+            hidden_states = self.cycle_embedding(hidden_states, cycle_k)
+
+        query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+        value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+        # 标准 RoPE (位置编码) — 在 Q/K 投影后施加
+        if position_embeddings is not None:
+            cos, sin = position_embeddings
+            query_states, key_states = apply_rotary_pos_emb(
+                query_states, key_states, cos, sin
+            )
+
+        # KV cache
+        if past_key_values is not None:
+            key_states, value_states = past_key_values.update(
+                key_states, value_states, self.layer_idx
+            )
+
+        # GQA: repeat KV heads
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
+
+        # Entropy temperature: 除法调制 query (等效于 QK^T / temp)
+        # entropy_temperature: [B, T], 范围 [0.5, 1.0]
+        if entropy_temperature is not None:
+            temp = entropy_temperature[:, None, :, None].to(
+                query_states.dtype
+            )  # [B, 1, S_q, 1]
+            query_states = query_states / temp
+
+        dropout_p = self.attention_dropout if self.training else 0.0
+
+        # SDPA: 无显式 mask 且无 KV cache 时用 is_causal=True (Flash Attention)
+        use_causal_flag = (
+            attention_mask is None
+            and past_key_values is None
+            and query_states.shape[2] == key_states.shape[2]
+        )
+
+        if use_causal_flag:
+            attn_output = F.scaled_dot_product_attention(
+                query_states, key_states, value_states,
+                dropout_p=dropout_p, is_causal=True, scale=self.scaling,
+            )
+        else:
+            attn_output = F.scaled_dot_product_attention(
+                query_states, key_states, value_states,
+                attn_mask=attention_mask, dropout_p=dropout_p, scale=self.scaling,
+            )
+
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(*input_shape, -1)
+        attn_output = self.o_proj(attn_output)
+
+        return attn_output, None

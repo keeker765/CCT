@@ -730,8 +730,7 @@ if start_step > 0:
 else:
     print('Training for %d optimizer steps (grad_accum=%d)...' % (max_steps, CFG['grad_accum']))
 
-avg = {'total': 0, 'lm': 0, 'mono': 0, 'iters': 0}
-avg_h_per_iter = []  # list of lists: each inner list = per-iter entropy for one step
+avg = {'total': 0, 'lm': 0, 'mono': 0, 'entropy': 0, 'entropy_std': 0, 'iters': 0}
 avg_n = 0
 _last_loss = 0.0
 _timeout_exit = False
@@ -765,8 +764,9 @@ if train_files is not None:
             avg['total'] += ld.get('loss_total', 0)
             avg['lm'] += ld.get('loss_lm', 0)
             avg['mono'] += ld.get('loss_mono', 0)
+            avg['entropy'] += out.get('mean_entropy', 0)
+            avg['entropy_std'] += out.get('std_entropy', 0)
             avg['iters'] += out.get('num_iterations', 0)
-            avg_h_per_iter.append(out.get('per_iter_entropy', []))
             avg_n += 1
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), CFG['max_grad_norm'])
@@ -778,18 +778,11 @@ if train_files is not None:
             eta_m = (elapsed / (gs + 1 - start_step)) * (max_steps - gs - 1) / 60
             tokens_done = (gs + 1) * eff_batch * CFG['max_seq_len']
             _last_loss = avg['total'] / n
-            # 计算每次迭代的平均 entropy
-            max_k = max((len(h) for h in avg_h_per_iter), default=0)
-            h_avg = []
-            for ki in range(max_k):
-                vals = [h[ki] for h in avg_h_per_iter if ki < len(h)]
-                h_avg.append(sum(vals) / len(vals) if vals else 0)
-            h_str = '[' + ','.join(['%.3f' % v for v in h_avg]) + ']'
             log_msg = ('[Step %d/%d] loss=%.4f | lm=%.4f mono=%.4f | '
-                  'H=%s iters=%d | '
+                  'H=%.3f+/-%.3f iters=%d | '
                   'lr=%.2e | %.1fM tok | ETA %.0fm' % (
                 gs + 1, max_steps, avg['total']/n, avg['lm']/n, avg['mono']/n,
-                h_str, avg['iters']/n,
+                avg['entropy']/n, avg['entropy_std']/n, avg['iters']/n,
                 optimizer.param_groups[0]['lr'], tokens_done / 1e6, eta_m))
             # 融合量 (每 50 个 log interval 报告一次)
             if cct_config.use_fusion_graft and (gs + 1) % (CFG['log_interval'] * 50) == 0:
@@ -798,8 +791,7 @@ if train_files is not None:
                     fstr = ' '.join(['%s=%.4f' % (k, v) for k, v in sorted(fmag.items())[:8]])
                     log_msg += '\\n  [Fusion] ' + fstr
             print(log_msg)
-            avg = {'total': 0, 'lm': 0, 'mono': 0, 'iters': 0}
-            avg_h_per_iter = []
+            avg = {'total': 0, 'lm': 0, 'mono': 0, 'entropy': 0, 'entropy_std': 0, 'iters': 0}
             avg_n = 0
 
         # === 超时检查 (eval 前) ===
@@ -873,8 +865,9 @@ else:
                 avg['total'] += ld.get('loss_total', 0)
                 avg['lm'] += ld.get('loss_lm', 0)
                 avg['mono'] += ld.get('loss_mono', 0)
+                avg['entropy'] += out.get('mean_entropy', 0)
+                avg['entropy_std'] += out.get('std_entropy', 0)
                 avg['iters'] += out.get('num_iterations', 0)
-                avg_h_per_iter.append(out.get('per_iter_entropy', []))
                 avg_n += 1
                 if gs_count % CFG['log_interval'] == 0:
                     n = max(avg_n, 1)
@@ -882,17 +875,11 @@ else:
                     eta_m = (elapsed / (gs_count - start_step)) * (max_steps - gs_count) / 60 if gs_count > start_step else 0
                     tokens_done = gs_count * eff_batch * CFG['max_seq_len']
                     _last_loss = avg['total'] / n
-                    max_k = max((len(h) for h in avg_h_per_iter), default=0)
-                    h_avg = []
-                    for ki in range(max_k):
-                        vals = [h[ki] for h in avg_h_per_iter if ki < len(h)]
-                        h_avg.append(sum(vals) / len(vals) if vals else 0)
-                    h_str = '[' + ','.join(['%.3f' % v for v in h_avg]) + ']'
                     log_msg = ('[Step %d/%d] loss=%.4f | lm=%.4f mono=%.4f | '
-                          'H=%s iters=%d | '
+                          'H=%.3f+/-%.3f iters=%d | '
                           'lr=%.2e | %.1fM tok | ETA %.0fm' % (
                         gs_count, max_steps, avg['total']/n, avg['lm']/n,
-                        avg['mono']/n, h_str, avg['iters']/n,
+                        avg['mono']/n, avg['entropy']/n, avg['entropy_std']/n, avg['iters']/n,
                         optimizer.param_groups[0]['lr'], tokens_done / 1e6, eta_m))
                     if cct_config.use_fusion_graft and gs_count % (CFG['log_interval'] * 50) == 0:
                         fmag = model.get_fusion_magnitudes()
@@ -900,8 +887,7 @@ else:
                             fstr = ' '.join(['%s=%.4f' % (k, v) for k, v in sorted(fmag.items())[:8]])
                             log_msg += '\\n  [Fusion] ' + fstr
                     print(log_msg)
-                    avg = {'total': 0, 'lm': 0, 'mono': 0, 'iters': 0}
-                    avg_h_per_iter = []
+                    avg = {'total': 0, 'lm': 0, 'mono': 0, 'entropy': 0, 'entropy_std': 0, 'iters': 0}
                     avg_n = 0
                 # 超时检查
                 _elapsed_h = (_time.time() - _t0) / 3600

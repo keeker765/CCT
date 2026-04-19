@@ -70,6 +70,11 @@
 5. **生成质量差**: 贪心解码产生重复退化文本，loss 低但不代表生成能力好
 6. entropy 从 1.5 单调降至 0.14，halt 分布过度集中
 
+## Kaggle 备用账号
+
+- **用户名**: vhmbhjfhgdgfx
+- **API Key**: eb633cf87424f56a940e7b72c1dedefc
+
 ## 已修复的 Bug
 
 1. **因果掩码缺失** (wrapped_model.py): transformers 5.x 的 create_causal_mask 返回 None，导致 Column 层无 causal mask → 添加手动上三角掩码回退
