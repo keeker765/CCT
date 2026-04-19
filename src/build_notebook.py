@@ -151,7 +151,6 @@ CFG = {{
     'log_interval': 20,
     'eval_interval': 100,
     'max_samples': 40000,
-    'max_steps': 100,  # 调试: 只跑 100 步
 }}
 
 # === Tokenizer ===
@@ -320,7 +319,7 @@ for epoch in range(CFG['num_epochs']):
         batch = {k: v.to(device) for k, v in batch.items()}
 
         # tau_halt 线性退火
-        tau_halt = compute_halt_tau(gs, total_steps,
+        tau_halt = compute_halt_tau(gs, max_steps,
                                    cct_config.halt_tau_start, cct_config.halt_tau_end)
         model.set_halt_tau(tau_halt)
 
@@ -350,9 +349,10 @@ for epoch in range(CFG['num_epochs']):
             elapsed = _time.time() - _t0
             eta_m = (elapsed / gs) * (max_steps - gs) / 60 if gs > 0 else 0
             print('[Step %d/%d] loss=%.4f | lm=%.4f pred=%.4f ent=%.4f ponder=%.4f | '
-                  'eff_iters=%.2f tau=%.3f | ETA %.0fm' % (
+                  'eff_iters=%.2f tau=%.3f | lr_base=%.2e lr_new=%.2e | ETA %.0fm' % (
                 gs, max_steps, avg['total']/n, avg['lm']/n, avg['pred']/n,
-                avg['entropy']/n, avg['ponder']/n, avg['eff_iters']/n, tau_halt, eta_m))
+                avg['entropy']/n, avg['ponder']/n, avg['eff_iters']/n, tau_halt,
+                optimizer.param_groups[0]['lr'], optimizer.param_groups[1]['lr'], eta_m))
             avg = {'total': 0, 'lm': 0, 'pred': 0, 'entropy': 0, 'ponder': 0, 'eff_iters': 0}
             avg_n = 0
 
