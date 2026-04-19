@@ -39,7 +39,7 @@ class CCTConfig:
     info_dim: int = 64   # 信息瓶颈维度 (低容量防止预测塌缩)
     delta_noise_scale: float = 0.1  # delta 感觉噪声 (train+inference 均生效)
 
-    # HaltHead 退火温度
+    # L6 halt 退火温度
     halt_tau_start: float = 1.0
     halt_tau_end: float = 0.01
 

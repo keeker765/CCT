@@ -1,25 +1,36 @@
-"""L6Precision — 精度加权注意力调制
+"""L6Precision — 皮层柱 L6 统一模块: 注意力调制 + 停止决策
 
-precision = 1 - sigmoid(score / τ_p)
-attention_bias = λ · precision
+生物学依据:
+  - L6CT → TRN → Thalamus: prediction error 驱动注意力增益控制
+    (Sherman & Guillery 2006; Kahn et al. 2010)
+  - Free Energy 收敛: error → 0 时处理终止, L5 输出当前信念
+    (Friston 2005; Bastos et al. 2012)
+  - L6CT → L5a 强兴奋: L6 激活同时抑制输入层(L4)、兴奋输出层(L5)
+    (Kim et al. 2014, J Neurosci)
 
-纯调制: 只影响 attention logits, 不融合输入, 不做残差。
-τ_p 是固定超参数 (推荐 0.5), 控制 easy/hard token 区分度。
+两个输出, 同一个信号 (prediction score):
+  attention_bias = λ · (1 - σ(score / τ_p))    — 注意力增益
+  p_halt = σ((gain · score + bias) / τ_halt)    — 停止概率
 """
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class L6Precision(nn.Module):
-    """L6 精度加权模块
+    """L6 皮层柱核心: prediction error → attention + halt
 
-    将 prediction score 转换为 attention bias:
-    1. precision = 1 - sigmoid(score / τ_p)
-       - score 高 (预测准) → precision 低 → 少关注
-       - score 低 (预测差) → precision 高 → 多关注
-    2. attention_bias = λ · precision
-       - λ 为可学习标量, 控制调制强度
+    注意力调制 (L6→Thalamus):
+      precision = 1 - σ(score / τ_p)
+      attention_bias = λ · precision
+      高 score (好预测) → precision 低 → 少关注
+      低 score (surprise) → precision 高 → 多关注
+
+    停止决策 (L6→L5, Free Energy 收敛):
+      p_halt = σ((softplus(gain) · score + bias) / τ_halt)
+      高 score → 收敛 → halt
+      低 score → 继续处理
     """
 
     def __init__(
@@ -31,14 +42,34 @@ class L6Precision(nn.Module):
         self.lambda_precision = nn.Parameter(torch.tensor(lambda_init))
         self.temperature = temperature  # 固定超参数
 
-    def forward(self, score: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            score: [batch, seq_len] — prediction score (已 detach)
+        # Halt 参数: score → 停止决策
+        self._halt_gain = nn.Parameter(torch.tensor(1.0))   # softplus 保证 > 0
+        self.halt_bias = nn.Parameter(torch.tensor(0.0))     # 仿射偏移
 
+    def compute_attention_bias(self, score: torch.Tensor) -> torch.Tensor:
+        """Score → attention 增益调制 (用于 column layers)
+
+        Args:
+            score: [batch, seq_len] — prediction score (detached)
         Returns:
-            attention_bias: [batch, seq_len] — 用于调制 attention logits
+            attention_bias: [batch, seq_len]
         """
         precision = 1.0 - torch.sigmoid(score / self.temperature)
-        attention_bias = self.lambda_precision * precision
-        return attention_bias
+        return self.lambda_precision * precision
+
+    def compute_halt(
+        self, score: torch.Tensor, tau_halt: float = 1.0
+    ) -> torch.Tensor:
+        """Score → 停止概率 (用于 ACT)
+
+        p_halt = σ((softplus(gain) · score + bias) / τ_halt)
+
+        Args:
+            score: [batch, seq_len] — prediction score (detached)
+            tau_halt: 退火温度 (1.0 → 0.01)
+        Returns:
+            p_halt: [batch, seq_len]
+        """
+        gain = F.softplus(self._halt_gain)
+        halt_logit = gain * score + self.halt_bias
+        return torch.sigmoid(halt_logit / tau_halt)

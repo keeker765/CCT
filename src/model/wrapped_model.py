@@ -3,9 +3,10 @@
 架构: Fixed Front (2层) → Column (3层 × K循环) → Fixed Back (2层)
 预训练层映射: Layer 0,1 → Front; Layer 2,3,4 → Column; Layer 14,15 → Back
 
-Per-token ACT + 温度退火:
+Per-token ACT + L6 驱动停止:
 - 训练: 所有轮都跑, 输出 = per-token 加权和 (remainder × p_halt × h)
 - 推理: 同机制, remainder < threshold 时早停; inference_temperature 控制推理强度
+- L6 同时输出 attention_bias (注意力调制) 和 p_halt (停止决策)
 - τ_halt 从 1.0 退火到 0.01 → 训练/推理一致
 """
 
@@ -32,7 +33,6 @@ from .cct_decoder_layer import CCTDecoderLayer
 from .cycle_embedding import RotaryCycleEmbedding
 from .predictor import CCTPredictor
 from .l6_precision import L6Precision
-from .halt_head import HaltHead
 from .losses import compute_lm_loss, compute_total_loss
 
 
@@ -107,7 +107,6 @@ class CCTLlamaModel(nn.Module):
             lambda_init=config.lambda_precision_init,
             temperature=config.precision_temperature,
         )
-        self.halt_head = HaltHead(config.d_model)
 
         # 迭代间 RMSNorm (防发散)
         self.inter_iter_norm = LlamaRMSNorm(
@@ -128,7 +127,6 @@ class CCTLlamaModel(nn.Module):
         base_dtype = self._model_dtype
         self.cct_predictor.to(base_dtype)
         self.l6_precision.to(base_dtype)
-        self.halt_head.to(base_dtype)
         self.inter_iter_norm.to(base_dtype)
 
         # 释放原模型的未使用层以节省显存
@@ -274,11 +272,14 @@ class CCTLlamaModel(nn.Module):
                 # a. 保存列运算前的状态 (用于前向预测)
                 h_before = h
 
-                # b. 3个 CCTDecoderLayer forward (共享权重)
+                # b. L6 注意力调制 (用 score[k-1], 仅 k>0)
                 precision_bias = None
                 if k > 0 and all_scores:
-                    precision_bias = self.l6_precision(all_scores[-1])
+                    precision_bias = self.l6_precision.compute_attention_bias(
+                        all_scores[-1]
+                    )
 
+                # c. 3个 CCTDecoderLayer forward (共享权重)
                 for ci, col_layer in enumerate(self.column_layers):
                     col_cycle_k = k * len(self.column_layers) + ci
                     col_precision = precision_bias if ci == 0 else None
@@ -303,30 +304,30 @@ class CCTLlamaModel(nn.Module):
                             precision_bias=col_precision,
                         )
 
-                # c. 迭代间 RMSNorm (防发散)
+                # d. 迭代间 RMSNorm (防发散)
                 h = self.inter_iter_norm(h)
 
-                # d. HaltHead
-                p_halt = self.halt_head(h, tau_halt)
-                p_halts.append(p_halt)
-                remainders_list.append(remainder.clone())
-
-                # e. ACT per-token 加权累积
-                weight = (remainder * p_halt).unsqueeze(-1)  # [batch, seq_len, 1]
-                output = output + weight * h
-
-                # f. 更新 per-token remainder
-                remainder = remainder * (1.0 - p_halt)
-
-                # g. 前向预测 Score: predict h_k from h_{k-1}
+                # e. Score: 当前迭代的预测误差
                 score = self.cct_predictor.compute_score(h_before, h)
                 all_scores.append(score)
 
-                # h. 前向预测 L_pred: 列变换可预测性
+                # f. L6 停止决策 (用 score[k], 当前迭代)
+                p_halt = self.l6_precision.compute_halt(score, tau_halt)
+                p_halts.append(p_halt)
+                remainders_list.append(remainder.clone())
+
+                # g. ACT per-token 加权累积
+                weight = (remainder * p_halt).unsqueeze(-1)  # [batch, seq_len, 1]
+                output = output + weight * h
+
+                # h. 更新 per-token remainder
+                remainder = remainder * (1.0 - p_halt)
+
+                # i. 前向预测 L_pred: 列变换可预测性
                 l_pred_k = self.cct_predictor.compute_pred_loss(h_before, h)
                 pred_losses.append(l_pred_k)
 
-                # h. 提前退出优化 (remainder 极小时无意义继续)
+                # j. 提前退出优化 (remainder 极小时无意义继续)
                 if remainder.max().item() < 1e-4:
                     break
 
@@ -352,9 +353,12 @@ class CCTLlamaModel(nn.Module):
             for k in range(self.config.max_iter):
                 h_before = h
 
+                # L6 注意力调制 (用 score[k-1], 仅 k>0)
                 precision_bias = None
                 if k > 0 and all_scores:
-                    precision_bias = self.l6_precision(all_scores[-1])
+                    precision_bias = self.l6_precision.compute_attention_bias(
+                        all_scores[-1]
+                    )
 
                 for ci, col_layer in enumerate(self.column_layers):
                     col_cycle_k = k * len(self.column_layers) + ci
@@ -370,16 +374,17 @@ class CCTLlamaModel(nn.Module):
 
                 h = self.inter_iter_norm(h)
 
-                p_halt = self.halt_head(h, inf_tau)
+                # Score: 当前迭代的预测误差
+                score = self.cct_predictor.compute_score(h_before, h)
+                all_scores.append(score)
+
+                # L6 停止决策 (用 score[k], 当前迭代)
+                p_halt = self.l6_precision.compute_halt(score, inf_tau)
 
                 # Per-token ACT 累积
                 weight = (remainder * p_halt).unsqueeze(-1)
                 output = output + weight * h
                 remainder = remainder * (1.0 - p_halt)
-
-                # 前向预测 Score: predict h_k from h_{k-1}
-                score = self.cct_predictor.compute_score(h_before, h)
-                all_scores.append(score)
 
                 # 所有有效 token 的 remainder 都足够小时停止
                 if k >= self.config.min_iter - 1 and remainder.max().item() < 1e-3:
@@ -453,7 +458,7 @@ class CCTLlamaModel(nn.Module):
         }
 
     def set_halt_tau(self, tau: float):
-        """更新 HaltHead 退火温度"""
+        """更新 L6 停止退火温度"""
         self.halt_tau.fill_(tau)
 
     def enable_gradient_checkpointing(self):
@@ -463,7 +468,7 @@ class CCTLlamaModel(nn.Module):
         """返回分层学习率参数组"""
         new_modules = [
             self.cct_predictor, self.l6_precision,
-            self.halt_head, self.inter_iter_norm,
+            self.inter_iter_norm,
         ]
         new_params = set()
         for m in new_modules:
@@ -488,7 +493,7 @@ class CCTLlamaModel(nn.Module):
         trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
         cct_modules = [
             self.cct_predictor, self.l6_precision,
-            self.halt_head, self.inter_iter_norm,
+            self.inter_iter_norm,
         ]
         cct_params = sum(
             p.numel() for m in cct_modules for p in m.parameters()

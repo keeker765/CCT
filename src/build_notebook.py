@@ -55,8 +55,7 @@ def cells_header() -> List[dict]:
 
 **架构**: Fixed Front (L0-L1) → Column (L2-L4, 循环复用 K 次) → Fixed Back (L14-L15)
 - **Predictor + AnchorMLP**: 预测编码误差信号
-- **L6 Precision**: query 侧乘性增益调制 (error-driven temperature scaling)
-- **HaltHead**: ACT 软停止 + τ 退火二值化
+- **L6 Precision**: 注意力增益调制 + ACT 停止决策 (统一误差信号驱动)
 - **RotaryCycleEmbed**: φ 黄金比例旋转循环嵌入
 
 **损失**: L_LM + λ_pred · L_pred + λ_entropy · H(halt)
@@ -99,7 +98,7 @@ print("CWD: %s" % os.getcwd())
 key_files = [
     "src/model/wrapped_model.py", "src/model/cct_attention.py",
     "src/model/predictor.py", "src/model/l6_precision.py",
-    "src/model/halt_head.py", "src/model/cycle_embedding.py",
+    "src/model/cycle_embedding.py",
     "src/model/losses.py", "src/model/column_config.py",
 ]
 for f in key_files:
