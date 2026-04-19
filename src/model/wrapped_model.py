@@ -411,6 +411,7 @@ class CCTLlamaModel(nn.Module):
 
         # 计算 effective_iters (期望迭代数, 用于日志)
         effective_iters = 0.0
+        eff_iters_std = 0.0
         if p_halts:
             with torch.no_grad():
                 eff = torch.zeros_like(p_halts[0])
@@ -420,8 +421,14 @@ class CCTLlamaModel(nn.Module):
                     eff = eff + len(p_halts) * remainders_list[-1] * (1.0 - p_halts[-1])
                 if valid_mask is not None:
                     effective_iters = (eff * valid_mask).sum().item() / max(valid_mask.sum().item(), 1)
+                    eff_masked = eff[valid_mask.bool()]
+                    eff_iters_std = eff_masked.std().item() if eff_masked.numel() > 1 else 0.0
                 else:
                     effective_iters = eff.mean().item()
+                    eff_iters_std = eff.std().item()
+
+        # 每轮迭代的 pred_loss (用于诊断分布)
+        pred_losses_per_iter = [pl.item() for pl in pred_losses] if pred_losses else []
 
         return {
             "loss": loss,
@@ -431,6 +438,8 @@ class CCTLlamaModel(nn.Module):
             "scores": all_scores,
             "num_iterations": len(all_scores),
             "effective_iters": effective_iters,
+            "eff_iters_std": eff_iters_std,
+            "pred_losses_per_iter": pred_losses_per_iter,
         }
 
     def set_halt_tau(self, tau: float):

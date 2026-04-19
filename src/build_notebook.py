@@ -310,7 +310,7 @@ print('Training for %d steps (max_steps=%d, total_steps=%d)' % (
 _stop = False
 for epoch in range(CFG['num_epochs']):
     if _stop: break
-    avg = {'total': 0, 'lm': 0, 'pred': 0, 'entropy': 0, 'ponder': 0, 'eff_iters': 0}
+    avg = {'total': 0, 'lm': 0, 'pred': 0, 'entropy': 0, 'ponder': 0, 'eff_iters': 0, 'eff_std': 0, 'pred_std': 0}
     avg_n = 0
 
     for bi, batch in enumerate(train_loader):
@@ -318,7 +318,7 @@ for epoch in range(CFG['num_epochs']):
             _stop = True; break
         batch = {k: v.to(device) for k, v in batch.items()}
 
-        # tau_halt 线性退火
+        # tau_halt sigmoid 退火 (S 曲线: 末期慢降避免 loss 震荡)
         tau_halt = compute_halt_tau(gs, max_steps,
                                    cct_config.halt_tau_start, cct_config.halt_tau_end)
         model.set_halt_tau(tau_halt)
@@ -342,6 +342,9 @@ for epoch in range(CFG['num_epochs']):
         avg['entropy'] += ld.get('loss_entropy', 0)
         avg['ponder'] += ld.get('loss_ponder', 0)
         avg['eff_iters'] += out.get('effective_iters', 0)
+        avg['eff_std'] += out.get('eff_iters_std', 0)
+        _ppi = out.get('pred_losses_per_iter', [])
+        avg['pred_std'] += (torch.tensor(_ppi).std().item() if len(_ppi) > 1 else 0.0)
         avg_n += 1
 
         if gs > 0 and gs % CFG['log_interval'] == 0 and (bi + 1) % CFG['grad_accum'] == 0:
@@ -349,11 +352,12 @@ for epoch in range(CFG['num_epochs']):
             elapsed = _time.time() - _t0
             eta_m = (elapsed / gs) * (max_steps - gs) / 60 if gs > 0 else 0
             print('[Step %d/%d] loss=%.4f | lm=%.4f pred=%.4f ent=%.4f ponder=%.4f | '
-                  'eff_iters=%.2f tau=%.3f | lr_base=%.2e lr_new=%.2e | ETA %.0fm' % (
+                  'eff_iters=%.2f±%.2f pred_std=%.4f tau=%.3f | lr_base=%.2e lr_new=%.2e | ETA %.0fm' % (
                 gs, max_steps, avg['total']/n, avg['lm']/n, avg['pred']/n,
-                avg['entropy']/n, avg['ponder']/n, avg['eff_iters']/n, tau_halt,
+                avg['entropy']/n, avg['ponder']/n, avg['eff_iters']/n, avg['eff_std']/n,
+                avg['pred_std']/n, tau_halt,
                 optimizer.param_groups[0]['lr'], optimizer.param_groups[1]['lr'], eta_m))
-            avg = {'total': 0, 'lm': 0, 'pred': 0, 'entropy': 0, 'ponder': 0, 'eff_iters': 0}
+            avg = {'total': 0, 'lm': 0, 'pred': 0, 'entropy': 0, 'ponder': 0, 'eff_iters': 0, 'eff_std': 0, 'pred_std': 0}
             avg_n = 0
 
         if gs > 0 and gs % CFG['eval_interval'] == 0 and (bi + 1) % CFG['grad_accum'] == 0:

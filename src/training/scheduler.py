@@ -28,7 +28,17 @@ def compute_halt_tau(
     total_steps: int,
     tau_start: float = 1.0,
     tau_end: float = 0.01,
+    steepness: float = 10.0,
 ) -> float:
-    """线性退火 τ_halt: 从 tau_start → tau_end"""
+    """Sigmoid 退火 τ_halt: 从 tau_start → tau_end
+    
+    S 型曲线：开头/末尾慢，中间快，避免末期 loss 震荡。
+    steepness 控制 S 曲线的陡度（越大越接近阶梯函数）。
+    """
     progress = min(1.0, current_step / max(1, total_steps))
-    return tau_start + (tau_end - tau_start) * progress
+    # sigmoid 映射: 将 progress ∈ [0,1] 通过 S 曲线归一化到 [0,1]
+    raw_start = 1.0 / (1.0 + math.exp(steepness * 0.5))
+    raw_end = 1.0 / (1.0 + math.exp(-steepness * 0.5))
+    raw = 1.0 / (1.0 + math.exp(-steepness * (progress - 0.5)))
+    sigmoid_progress = (raw - raw_start) / (raw_end - raw_start)
+    return tau_start + (tau_end - tau_start) * sigmoid_progress
