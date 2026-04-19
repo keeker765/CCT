@@ -1,8 +1,9 @@
 """CCT Kaggle Baseline 2 Notebook 构建器
 
-消融实验: 无循环 7 层顺序前向 (与 CCT 对比)
-  - 从 Llama-3.2-1B 选取 CCT 使用的 7 层, 顺序拼接
-  - 无 Column 循环 / Predictor / L6 Precision / HaltHead
+消融实验: 无循环 5 层顺序前向 (与 CCT v2 对比)
+  - 从 Llama-3.2-1B 选取 CCT v2 使用的 5 层, 顺序拼接
+  - L0 (Front), L3, L8, L12 (Column), L15 (Back)
+  - 无 Column 循环 / Entropy halt / RotaryCycleEmbed / L_mono
   - 仅 L_LM 损失, 全参数统一 lr
   - 支持 pre-packed .pt 和 OpenHermes JSON 数据
 
@@ -54,24 +55,24 @@ def build_notebook(model_path: str = DEFAULT_MODEL,
     cells = [
         # ── Header ──
         md(f"""\
-# CCT 消融实验 — Baseline 2: 无循环 7 层顺序前向 (Kaggle)
+# CCT 消融实验 — Baseline 2: 无循环 5 层顺序前向 (Kaggle)
 
-**目的**: 与 CCT 对比, 验证 Column 循环机制的增益
+**目的**: 与 CCT v2 对比, 验证 Column 循环机制的增益
 
-**架构**: 从 Llama-3.2-1B (16层) 选取 CCT 使用的 7 层, 顺序拼接:
-- L0, L1 (CCT 的 Front)
-- L2, L7, L12 (CCT 的 Column, 但**不复用**, 仅前向一次)
-- L14, L15 (CCT 的 Back)
+**架构**: 从 Llama-3.2-1B (16层) 选取 CCT v2 使用的 5 层, 顺序拼接:
+- L0 (CCT 的 Front)
+- L3, L8, L12 (CCT 的 Column, 但**不循环**, 仅前向一次)
+- L15 (CCT 的 Back)
 
-**与 CCT 的区别**:
+**与 CCT v2 的区别**:
 - 无 Column 循环 (仅顺序前向一次)
-- 无 Predictor / L6 Precision / HaltHead / RotaryCycleEmbed
+- 无 Entropy-based halt / RotaryCycleEmbed / L_mono / per-query temperature
 - 仅 L_LM 损失
 - 全参数统一 lr={lr} (无分层)
 
 **公平对比**:
 - 相同数据, 相同 batch/lr/epochs
-- 相同 7 层, 相同初始权重"""),
+- 相同 5 层, 相同初始权重"""),
 
         # ── 安装 wheels ──
         code(f"""\
@@ -309,12 +310,12 @@ print('\\n数据就绪 ✓')"""),
 
         # ── 模型构建 ──
         code("""\
-# === 模型: 从 Llama-3.2-1B 选取 7 层, 顺序拼接 ===
+# === 模型: 从 Llama-3.2-1B 选取 5 层, 顺序拼接 ===
 from transformers import LlamaForCausalLM
 
 DTYPE = torch.bfloat16
 
-SELECTED_LAYERS = [0, 1, 2, 7, 12, 14, 15]  # 与 CCT 使用的层完全相同
+SELECTED_LAYERS = [0, 3, 8, 12, 15]  # 与 CCT v2 使用的层完全相同
 NUM_SELECTED = len(SELECTED_LAYERS)
 
 base = LlamaForCausalLM.from_pretrained(
@@ -435,7 +436,7 @@ max_steps = CFG['max_steps']
 max_hours = CFG['max_train_hours']
 ckpt_path = '/kaggle/working/output/baseline2_checkpoint.pt'
 
-print('Training for %d steps (Baseline 2: 7-layer sequential, lr={lr})...' % max_steps)
+print('Training for %d steps (Baseline 2: 5-layer sequential, lr={lr})...' % max_steps)
 
 avg_loss, avg_n = 0, 0
 _last_loss = 0.0

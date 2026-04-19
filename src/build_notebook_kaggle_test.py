@@ -284,8 +284,8 @@ from src.model.column_config import CCTConfig
 DTYPE = torch.bfloat16
 
 cct_config = CCTConfig(
-    max_iter=10,
-    lambda_mono=0.1,
+    max_iter=6,
+    lambda_mono=0.3,
     entropy_temp_scale=0.5,
     halt_entropy_threshold=0.3,
     use_ffn_expansion=False,
