@@ -29,7 +29,7 @@ class CCTConfig:
 
     # 循环参数
     min_iter: int = 1
-    max_iter: int = 10
+    max_iter: int = 6
     phi: float = 1.618  # 黄金比例
 
     # Column MLP 加宽 (Net2WiderNet) — 与 fusion_graft 互斥
@@ -49,9 +49,9 @@ class CCTConfig:
     # Entropy-based halt (v2)
     lambda_mono: float = 0.3         # L_mono 相对权重 (0.3 = 30% of LM, 自适应缩放)
     entropy_temp_scale: float = 0.5  # per-query temperature: temp = 1 - scale * H_norm
-    halt_entropy_threshold: float = 0.3  # 推理硬停止最终阈值
-    halt_threshold_start: float = 0.8    # 退火起始阈值 (训练初期 eval 几乎不停)
-    halt_threshold_end: float = 0.3      # 退火结束阈值 (= halt_entropy_threshold)
+    halt_entropy_threshold: float = 0.1  # 推理硬停止最终阈值
+    halt_threshold_start: float = 0.3    # 退火起始阈值 (训练初期 eval 较宽松)
+    halt_threshold_end: float = 0.1      # 退火结束阈值 (= halt_entropy_threshold)
 
     # 训练
     learning_rate: float = 2e-5
