@@ -122,18 +122,17 @@ class CCTTrainer:
                 num_iter = outputs.get("num_iterations", 0)
                 eff_iters = outputs.get("effective_iters", 0)
                 eff_std = outputs.get("eff_iters_std", 0)
-                pred_per_iter = outputs.get("pred_losses_per_iter", [])
-                pred_std = torch.tensor(pred_per_iter).std().item() if len(pred_per_iter) > 1 else 0.0
+                score_std = outputs.get("score_std", 0)
                 logger.info(
                     f"Step {self.global_step} | "
                     f"loss={loss_dict.get('loss_total', 0):.4f} | "
-                    f"lm={loss_dict.get('loss_lm', 0):.4f} | "
-                    f"pred={loss_dict.get('loss_pred', 0):.4f} | "
-                    f"entropy={loss_dict.get('loss_entropy', 0):.4f} | "
+                    f"lm={loss_dict.get('loss_lm', 0):.4f} "
+                    f"pred={loss_dict.get('loss_pred', 0):.4f} "
+                    f"ent={loss_dict.get('loss_entropy', 0):.4f} "
                     f"ponder={loss_dict.get('loss_ponder', 0):.4f} | "
-                    f"eff_iters={eff_iters:.2f}±{eff_std:.2f} | "
-                    f"pred_std={pred_std:.4f} | "
-                    f"τ_halt={tau_halt:.4f}"
+                    f"eff_iters={eff_iters:.2f}±{eff_std:.2f} "
+                    f"score_std={score_std:.4f} "
+                    f"tau={tau_halt:.3f}"
                 )
 
             # 保存

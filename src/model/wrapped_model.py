@@ -277,7 +277,9 @@ class CCTLlamaModel(nn.Module):
                 if k > 0 and all_scores:
                     precision_bias = self.l6_precision(all_scores[-1])
 
-                for col_layer in self.column_layers:
+                for ci, col_layer in enumerate(self.column_layers):
+                    col_cycle_k = k * len(self.column_layers) + ci
+                    col_precision = precision_bias if ci == 0 else None
                     if self._gradient_checkpointing:
                         h = torch.utils.checkpoint.checkpoint(
                             col_layer, h.to(self._model_dtype),
@@ -285,8 +287,8 @@ class CCTLlamaModel(nn.Module):
                             position_ids,
                             None,  # past_key_values
                             position_embeddings,
-                            k,  # cycle_k
-                            precision_bias,
+                            col_cycle_k,  # cycle_k
+                            col_precision,
                             use_reentrant=False,
                         )
                     else:
@@ -295,8 +297,8 @@ class CCTLlamaModel(nn.Module):
                             attention_mask=layer_kwargs.get("attention_mask"),
                             position_ids=position_ids,
                             position_embeddings=position_embeddings,
-                            cycle_k=k,
-                            precision_bias=precision_bias,
+                            cycle_k=col_cycle_k,
+                            precision_bias=col_precision,
                         )
 
                 # c. 迭代间 RMSNorm (防发散)
@@ -352,14 +354,16 @@ class CCTLlamaModel(nn.Module):
                 if k > 0 and all_scores:
                     precision_bias = self.l6_precision(all_scores[-1])
 
-                for col_layer in self.column_layers:
+                for ci, col_layer in enumerate(self.column_layers):
+                    col_cycle_k = k * len(self.column_layers) + ci
+                    col_precision = precision_bias if ci == 0 else None
                     h = col_layer(
                         h.to(self._model_dtype),
                         attention_mask=layer_kwargs.get("attention_mask"),
                         position_ids=position_ids,
                         position_embeddings=position_embeddings,
-                        cycle_k=k,
-                        precision_bias=precision_bias,
+                        cycle_k=col_cycle_k,
+                        precision_bias=col_precision,
                     )
 
                 h = self.inter_iter_norm(h)
@@ -427,8 +431,12 @@ class CCTLlamaModel(nn.Module):
                     effective_iters = eff.mean().item()
                     eff_iters_std = eff.std().item()
 
-        # 每轮迭代的 pred_loss (用于诊断分布)
-        pred_losses_per_iter = [pl.item() for pl in pred_losses] if pred_losses else []
+        # score 在 token 维度的 std (L6 Precision 健康指标)
+        score_std_mean = 0.0
+        if all_scores:
+            with torch.no_grad():
+                score_stds = [s.std(dim=-1).mean().item() for s in all_scores]
+                score_std_mean = sum(score_stds) / len(score_stds)
 
         return {
             "loss": loss,
@@ -439,7 +447,7 @@ class CCTLlamaModel(nn.Module):
             "num_iterations": len(all_scores),
             "effective_iters": effective_iters,
             "eff_iters_std": eff_iters_std,
-            "pred_losses_per_iter": pred_losses_per_iter,
+            "score_std": score_std_mean,
         }
 
     def set_halt_tau(self, tau: float):
