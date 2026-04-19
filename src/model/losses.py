@@ -3,7 +3,7 @@
 L_total = mean(L_LM_k) + λ_mono · L_mono
 
 - L_LM_k: 每次迭代通过 back+norm+lm_head 的 CrossEntropy
-- L_mono: 单调 entropy loss — 惩罚 entropy 在相邻迭代间上升
+- L_mono: entropy 方向损失 — 奖励递减，惩罚递增 (无 ReLU，双向)
 """
 
 import torch
@@ -29,16 +29,19 @@ def compute_monotonic_entropy_loss(
     entropies: List[torch.Tensor],
     valid_mask: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """L_mono: 惩罚 entropy 在相邻迭代间上升
+    """L_mono: 鼓励 entropy 在相邻迭代间递减
 
-    L_mono = Σ_{k=0}^{K-2} mean(ReLU(H_{k+1} - H_k)) / (K-1)
+    L_mono = Σ_{k=0}^{K-2} masked_mean(H_{k+1} - H_k) / (K-1)
+
+    正值 = entropy 上升 → 惩罚 (增大 total loss)
+    负值 = entropy 下降 → 奖励 (减小 total loss)
 
     Args:
         entropies: [H_0, H_1, ..., H_{K-1}], 每个 [B, T]
         valid_mask: [B, T] — 1=有效, 0=padding
 
     Returns:
-        l_mono: 标量
+        l_mono: 标量 (可为负)
     """
     if len(entropies) < 2:
         return torch.tensor(0.0, device=entropies[0].device)
@@ -47,12 +50,11 @@ def compute_monotonic_entropy_loss(
     loss = torch.tensor(0.0, device=entropies[0].device)
     for k in range(len(entropies) - 1):
         diff = entropies[k + 1] - entropies[k]  # [B, T]
-        penalty = F.relu(diff)
         if valid_mask is not None:
-            penalty = (penalty * valid_mask).sum() / (valid_mask.sum() + eps)
+            step_loss = (diff * valid_mask).sum() / (valid_mask.sum() + eps)
         else:
-            penalty = penalty.mean()
-        loss = loss + penalty
+            step_loss = diff.mean()
+        loss = loss + step_loss
 
     return loss / (len(entropies) - 1)
 
