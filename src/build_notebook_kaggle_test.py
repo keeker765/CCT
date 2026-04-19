@@ -19,7 +19,7 @@ from typing import List
 DEFAULT_OUTPUT = "notebooks/cct_kaggle_test.ipynb"
 
 DEFAULT_MODEL = "/kaggle/input/datasets/wukeneth/llama-3-2-1b-base"
-DEFAULT_DATA = "/kaggle/input/datasets/wukeneth/cct-pretrain-data"
+DEFAULT_DATA = "/kaggle/input/datasets/wukeneth/cct-data"
 DEFAULT_CODE = "/kaggle/input/datasets/wukeneth/cct-code"
 
 
@@ -48,11 +48,12 @@ def _lines(text: str) -> List[str]:
 def build_notebook(model_path: str = DEFAULT_MODEL,
                    data_path: str = DEFAULT_DATA,
                    code_path: str = DEFAULT_CODE,
-                   max_steps: int = 20) -> dict:
+                   max_steps: int = 0) -> dict:
+    steps_label = '%d 步' % max_steps if max_steps > 0 else '全量数据'
     cells = [
         # ── Header ──
         md(f"""\
-# CCT 快速测试 — {max_steps} 步验证 Pipeline
+# CCT 测试 — {steps_label} 训练
 
 > ⚠️ **需要**: GPU T4/P100, **Internet ON**
 
@@ -146,19 +147,19 @@ elif os.path.isfile(MOUNT_DATA):
 
 assert DATA_DIR or DATA_FILE, '数据路径无效: %s' % MOUNT_DATA
 
-MAX_STEPS = {max_steps}
+MAX_STEPS = {max_steps}  # 0 = auto (全量数据)
 CFG = {{
     'max_steps': MAX_STEPS,
     'batch_size': 16,
     'grad_accum': 2,
     'max_seq_len': 2048,
-    'lr': 1e-4,
-    'new_lr': 5e-4,
+    'lr': 2e-5,
+    'new_lr': 2e-5,
     'max_grad_norm': 1.0,
     'weight_decay': 0.01,
-    'warmup_steps': min(10, MAX_STEPS // 5),
+    'warmup_steps': 50,
     'log_interval': 5,
-    'eval_interval': 100,         # eval every 100 steps
+    'eval_interval': 100,
     'eval_chunks': 50,
 }}
 
@@ -175,6 +176,13 @@ if DATA_DIR:
     sample = torch.load(train_files[0], weights_only=False)
     print('Chunks/file: %d' % len(sample))
     del sample
+    # 自动计算 max_steps
+    if CFG['max_steps'] <= 0:
+        total_chunks = len(train_files) * len(torch.load(train_files[0], weights_only=False))
+        eff_batch = CFG['batch_size'] * CFG['grad_accum']
+        CFG['max_steps'] = total_chunks // eff_batch
+        CFG['warmup_steps'] = min(50, CFG['max_steps'] // 10)
+        print('Auto max_steps=%d' % CFG['max_steps'])
 else:
     print('OpenHermes JSON: %s' % DATA_FILE)
     import json as _json
@@ -255,6 +263,13 @@ else:
     eval_data = [eval_ds[i] for i in range(min(len(eval_ds), CFG['eval_chunks']))]
     print('Train: %d, Eval: %d' % (len(train_ds), len(eval_data)))
     train_files = None
+    # 自动计算 max_steps
+    if CFG['max_steps'] <= 0:
+        eff_batch = CFG['batch_size'] * CFG['grad_accum']
+        CFG['max_steps'] = len(train_ds) // eff_batch
+        CFG['warmup_steps'] = min(50, CFG['max_steps'] // 10)
+        print('Auto max_steps=%d (from %d samples, eff_batch=%d)' % (
+            CFG['max_steps'], len(train_ds), eff_batch))
 
 eval_loader = DataLoader(ListDataset(eval_data), batch_size=CFG['batch_size'], num_workers=0)
 print('\\n数据就绪 ✓')"""),
@@ -303,7 +318,7 @@ print('模型就绪 ✓')"""),
 
         # ── 训练 ──
         code(f"""\
-# === 训练 ({max_steps} 步测试) ===
+# === 训练 ===
 from torch.optim import AdamW
 from src.training.scheduler import get_cosine_schedule_with_warmup, compute_halt_threshold
 
@@ -642,7 +657,7 @@ def main():
     parser.add_argument("--model", default=DEFAULT_MODEL)
     parser.add_argument("--data", default=DEFAULT_DATA)
     parser.add_argument("--code", default=DEFAULT_CODE)
-    parser.add_argument("--steps", type=int, default=20)
+    parser.add_argument("--steps", type=int, default=0, help="0 = auto (全量数据)")
     args = parser.parse_args()
 
     nb = build_notebook(args.model, args.data, args.code, args.steps)
@@ -650,8 +665,9 @@ def main():
     p.parent.mkdir(parents=True, exist_ok=True)
     with open(p, "w", encoding="utf-8") as f:
         json.dump(nb, f, ensure_ascii=False, indent=1)
-    print("测试 notebook 已生成: %s (%d cells, %d steps)" % (
-        p.resolve(), len(nb["cells"]), args.steps))
+    steps_label = '%d steps' % args.steps if args.steps > 0 else 'auto (全量)'
+    print("测试 notebook 已生成: %s (%d cells, %s)" % (
+        p.resolve(), len(nb["cells"]), steps_label))
 
 
 if __name__ == "__main__":

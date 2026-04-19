@@ -778,13 +778,16 @@ if train_files is not None:
             eta_m = (elapsed / (gs + 1 - start_step)) * (max_steps - gs - 1) / 60
             tokens_done = (gs + 1) * eff_batch * CFG['max_seq_len']
             _last_loss = avg['total'] / n
-            # 计算每次迭代的平均 entropy
+            # 计算每次迭代的平均 entropy (mean±std)
             max_k = max((len(h) for h in avg_h_per_iter), default=0)
-            h_avg = []
+            h_parts = []
             for ki in range(max_k):
-                vals = [h[ki] for h in avg_h_per_iter if ki < len(h)]
-                h_avg.append(sum(vals) / len(vals) if vals else 0)
-            h_str = '[' + ','.join(['%.3f' % v for v in h_avg]) + ']'
+                means = [h[ki][0] for h in avg_h_per_iter if ki < len(h)]
+                stds = [h[ki][1] for h in avg_h_per_iter if ki < len(h)]
+                m = sum(means) / len(means) if means else 0
+                s = sum(stds) / len(stds) if stds else 0
+                h_parts.append('%.3f±%.3f' % (m, s))
+            h_str = '[' + ', '.join(h_parts) + ']'
             log_msg = ('[Step %d/%d] loss=%.4f | lm=%.4f mono=%.4f | '
                   'H=%s iters=%d | '
                   'lr=%.2e | %.1fM tok | ETA %.0fm' % (
@@ -883,11 +886,14 @@ else:
                     tokens_done = gs_count * eff_batch * CFG['max_seq_len']
                     _last_loss = avg['total'] / n
                     max_k = max((len(h) for h in avg_h_per_iter), default=0)
-                    h_avg = []
+                    h_parts = []
                     for ki in range(max_k):
-                        vals = [h[ki] for h in avg_h_per_iter if ki < len(h)]
-                        h_avg.append(sum(vals) / len(vals) if vals else 0)
-                    h_str = '[' + ','.join(['%.3f' % v for v in h_avg]) + ']'
+                        means = [h[ki][0] for h in avg_h_per_iter if ki < len(h)]
+                        stds = [h[ki][1] for h in avg_h_per_iter if ki < len(h)]
+                        m = sum(means) / len(means) if means else 0
+                        s = sum(stds) / len(stds) if stds else 0
+                        h_parts.append('%.3f±%.3f' % (m, s))
+                    h_str = '[' + ', '.join(h_parts) + ']'
                     log_msg = ('[Step %d/%d] loss=%.4f | lm=%.4f mono=%.4f | '
                           'H=%s iters=%d | '
                           'lr=%.2e | %.1fM tok | ETA %.0fm' % (
