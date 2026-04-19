@@ -322,7 +322,8 @@ max_steps = CFG['max_steps']
 eff_batch = CFG['batch_size'] * CFG['grad_accum']
 print('Training %d steps (eff_batch=%d)...' % (max_steps, eff_batch))
 
-avg = {{'total': 0, 'lm': 0, 'mono': 0, 'entropy': 0, 'entropy_std': 0, 'iters': 0}}
+avg = {{'total': 0, 'lm': 0, 'mono': 0, 'iters': 0}}
+avg_h_per_iter = []
 avg_n = 0
 
 if train_files is not None:
@@ -350,9 +351,8 @@ if train_files is not None:
             avg['total'] += ld.get('loss_total', 0)
             avg['lm'] += ld.get('loss_lm', 0)
             avg['mono'] += ld.get('loss_mono', 0)
-            avg['entropy'] += out.get('mean_entropy', 0)
-            avg['entropy_std'] += out.get('std_entropy', 0)
             avg['iters'] += out.get('num_iterations', 0)
+            avg_h_per_iter.append(out.get('per_iter_entropy', []))
             avg_n += 1
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), CFG['max_grad_norm'])
@@ -363,13 +363,20 @@ if train_files is not None:
             elapsed = time.time() - t0
             eta_m = (elapsed / (gs + 1)) * (max_steps - gs - 1) / 60
             tokens_done = (gs + 1) * eff_batch * CFG['max_seq_len']
+            max_k = max((len(h) for h in avg_h_per_iter), default=0)
+            h_avg = []
+            for ki in range(max_k):
+                vals = [h[ki] for h in avg_h_per_iter if ki < len(h)]
+                h_avg.append(sum(vals) / len(vals) if vals else 0)
+            h_str = '[' + ','.join(['%.3f' % v for v in h_avg]) + ']'
             print('[Step %d/%d] loss=%.4f | lm=%.4f mono=%.4f | '
-                  'H=%.3f+/-%.3f iters=%d | '
+                  'H=%s iters=%d | '
                   'lr=%.2e | %.1fM tok | ETA %.0fm' % (
                 gs + 1, max_steps, avg['total']/n, avg['lm']/n, avg['mono']/n,
-                avg['entropy']/n, avg['entropy_std']/n, avg['iters']/n,
+                h_str, avg['iters']/n,
                 optimizer.param_groups[0]['lr'], tokens_done / 1e6, eta_m))
-            avg = {{'total': 0, 'lm': 0, 'mono': 0, 'entropy': 0, 'entropy_std': 0, 'iters': 0}}
+            avg = {{'total': 0, 'lm': 0, 'mono': 0, 'iters': 0}}
+            avg_h_per_iter = []
             avg_n = 0
 
         # === Eval ===
@@ -412,22 +419,28 @@ else:
             avg['total'] += ld.get('loss_total', 0)
             avg['lm'] += ld.get('loss_lm', 0)
             avg['mono'] += ld.get('loss_mono', 0)
-            avg['entropy'] += out.get('mean_entropy', 0)
-            avg['entropy_std'] += out.get('std_entropy', 0)
             avg['iters'] += out.get('num_iterations', 0)
+            avg_h_per_iter.append(out.get('per_iter_entropy', []))
             avg_n += 1
             if gs_count % CFG['log_interval'] == 0:
                 n = max(avg_n, 1)
                 elapsed = time.time() - t0
                 eta_m = (elapsed / gs_count) * (max_steps - gs_count) / 60 if gs_count > 0 else 0
                 tokens_done = gs_count * eff_batch * CFG['max_seq_len']
+                max_k = max((len(h) for h in avg_h_per_iter), default=0)
+                h_avg = []
+                for ki in range(max_k):
+                    vals = [h[ki] for h in avg_h_per_iter if ki < len(h)]
+                    h_avg.append(sum(vals) / len(vals) if vals else 0)
+                h_str = '[' + ','.join(['%.3f' % v for v in h_avg]) + ']'
                 print('[Step %d/%d] loss=%.4f | lm=%.4f mono=%.4f | '
-                      'H=%.3f+/-%.3f iters=%d | '
+                      'H=%s iters=%d | '
                       'lr=%.2e | %.1fM tok | ETA %.0fm' % (
                     gs_count, max_steps, avg['total']/n, avg['lm']/n, avg['mono']/n,
-                    avg['entropy']/n, avg['entropy_std']/n, avg['iters']/n,
+                    h_str, avg['iters']/n,
                     optimizer.param_groups[0]['lr'], tokens_done / 1e6, eta_m))
-                avg = {{'total': 0, 'lm': 0, 'mono': 0, 'entropy': 0, 'entropy_std': 0, 'iters': 0}}
+                avg = {{'total': 0, 'lm': 0, 'mono': 0, 'iters': 0}}
+                avg_h_per_iter = []
                 avg_n = 0
             if gs_count % CFG['eval_interval'] == 0:
                 model.eval()
