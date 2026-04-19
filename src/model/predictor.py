@@ -48,7 +48,7 @@ class CCTPredictor(nn.Module):
 
     def predict(self, h_prev: torch.Tensor) -> torch.Tensor:
         """从 h_prev 直接预测 delta 的投影"""
-        return self.predictor(h_prev.to(self.predictor.weight.dtype))
+        return self.predictor(h_prev.to(self.predictor[0].weight.dtype))
 
     def compute_pred_loss(
         self, h_prev: torch.Tensor, h_curr: torch.Tensor
