@@ -36,7 +36,8 @@ class CCTConfig:
     precision_temperature: float = 0.5  # 固定超参数
 
     # Predictor
-    info_dim: int = 256  # info_proj 降维维度 (与 PPG 一致)
+    info_dim: int = 64   # 信息瓶颈维度 (低容量防止预测塌缩)
+    delta_noise_scale: float = 0.1  # delta 感觉噪声 (train+inference 均生效)
 
     # HaltHead 退火温度
     halt_tau_start: float = 1.0

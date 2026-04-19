@@ -100,7 +100,9 @@ class CCTLlamaModel(nn.Module):
             self.back_layers.append(base_model.model.layers[src_idx])
 
         # === CCT 新增模块 ===
-        self.cct_predictor = CCTPredictor(config.d_model, config.info_dim)
+        self.cct_predictor = CCTPredictor(
+            config.d_model, config.info_dim, config.delta_noise_scale
+        )
         self.l6_precision = L6Precision(
             lambda_init=config.lambda_precision_init,
             temperature=config.precision_temperature,

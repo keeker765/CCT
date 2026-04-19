@@ -1,23 +1,23 @@
-"""CCT Predictor — 前向预测 (predict column residual Δ, 低容量版)
+"""CCT Predictor — 前向预测 (predict column residual Δ)
 
 设计:
-  predictor 直接从 d_model 空间映射到 info_dim (单层),
-  去掉了 info_proj 共享投影, 降低 predictor 容量防止塌缩。
+  predictor 直接从 d_model 映射到 info_dim (单层, 低容量),
+  去掉了 info_proj 共享投影。
 
   目标侧使用冻结随机投影 (target_proj), 不参与优化。
-  predictor 无法通过联合优化投影空间来降低任务难度。
+  delta 加入感觉噪声 (sensory noise), 在训练和推理时均生效,
+  防止 score 过度精确, 保持 L6 Precision 的 token 差异化。
 
 梯度流向:
   预测侧: h_prev.detach() → predictor(d_model→info_dim) → z_pred
            ✓ predictor 获得梯度
-  目标侧: delta.detach() → target_proj(冻结) → z_anchor.detach()
+  目标侧: (delta + noise).detach() → target_proj(冻结) → z_anchor.detach()
            ✗ 完全无梯度
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
 
 
 class CCTPredictor(nn.Module):
@@ -25,19 +25,26 @@ class CCTPredictor(nn.Module):
 
     predictor:   Linear(d_model → info_dim) — 直接映射, 单层
     target_proj: Linear(d_model → info_dim) — 冻结随机投影
+    noise_scale: delta 感觉噪声强度 (train + inference)
     """
 
-    def __init__(self, d_model: int, info_dim: int = 256, dropout: float = 0.3):
+    def __init__(self, d_model: int, info_dim: int = 64,
+                 noise_scale: float = 0.1):
         super().__init__()
         self.info_dim = info_dim
-        # 单层 + dropout (模拟神经噪声, 防止预测过度精确)
-        self.predictor = nn.Sequential(
-            nn.Linear(d_model, info_dim),
-            nn.Dropout(dropout),
-        )
+        self.noise_scale = noise_scale
+        self.predictor = nn.Linear(d_model, info_dim)
         # 冻结随机投影: delta → info_dim (不可训练)
         self.target_proj = nn.Linear(d_model, info_dim, bias=False)
         self.target_proj.weight.requires_grad_(False)
+
+    def _noisy_delta(self, h_prev: torch.Tensor,
+                     h_curr: torch.Tensor) -> torch.Tensor:
+        """计算带感觉噪声的 delta"""
+        delta = (h_curr - h_prev).detach()
+        if self.noise_scale > 0:
+            delta = delta + self.noise_scale * torch.randn_like(delta)
+        return delta
 
     def predict(self, h_prev: torch.Tensor) -> torch.Tensor:
         """从 h_prev 直接预测 delta 的投影"""
@@ -54,7 +61,7 @@ class CCTPredictor(nn.Module):
         Returns:
             loss: 标量
         """
-        delta = (h_curr - h_prev).detach()
+        delta = self._noisy_delta(h_prev, h_curr)
         z_pred = self.predict(h_prev.detach())
         z_anchor = self.target_proj(
             delta.to(self.target_proj.weight.dtype)
@@ -78,7 +85,7 @@ class CCTPredictor(nn.Module):
         Returns:
             score: [B, T] — cosine similarity, 范围 [-1, 1]
         """
-        delta = (h_curr - h_prev).detach()
+        delta = self._noisy_delta(h_prev, h_curr)
         z_pred = self.predict(h_prev).detach()
         z_anchor = self.target_proj(
             delta.to(self.target_proj.weight.dtype)
