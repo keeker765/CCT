@@ -1,4 +1,4 @@
-"""CCTConfig — 皮层柱 Transformer 配置"""
+"""CCTConfig — 皮层柱 Transformer 配置 (v2: entropy-driven)"""
 
 from dataclasses import dataclass, field
 from typing import List
@@ -8,8 +8,9 @@ from typing import List
 class CCTConfig:
     """CCT 整体配置
 
-    架构: Fixed Front → Column (循环) → Fixed Back
-    层映射: Llama 3.2 1B (16层) → 7层迁移
+    架构: Fixed Front (1层) → Column (3层 × K循环) → Fixed Back (1层)
+    预训练层映射: Llama 3.2 1B (16层) → 5层迁移
+    v2: output entropy 驱动停止 + per-query attention temperature
     """
     # 基座模型
     model_name: str = "unsloth/Llama-3.2-1B"
@@ -22,9 +23,9 @@ class CCTConfig:
     rms_norm_eps: float = 1e-5
 
     # 预训练层映射
-    pretrained_front_layers: List[int] = field(default_factory=lambda: [0, 1])
-    pretrained_column_layers: List[int] = field(default_factory=lambda: [2, 7, 12])
-    pretrained_back_layers: List[int] = field(default_factory=lambda: [14, 15])
+    pretrained_front_layers: List[int] = field(default_factory=lambda: [0])
+    pretrained_column_layers: List[int] = field(default_factory=lambda: [3, 8, 12])
+    pretrained_back_layers: List[int] = field(default_factory=lambda: [15])
 
     # 循环参数
     min_iter: int = 1
@@ -45,26 +46,10 @@ class CCTConfig:
     fusion_pool_donors: bool = True  # True=先平均多个 donor 权重, False=未来扩展
     fusion_freeze_base: bool = False # True=冻结被包装的基础权重, 仅训练 A/B
 
-    # L6 Precision
-    lambda_precision_init: float = 1.0
-    precision_temperature: float = 0.5  # 固定超参数
-
-    # Predictor
-    info_dim: int = 64   # 信息瓶颈维度 (低容量防止预测塌缩)
-    delta_noise_scale: float = 0.1  # delta 感觉噪声 (train+inference 均生效)
-
-    # L6 halt 退火温度
-    halt_tau_start: float = 1.0
-    halt_tau_end: float = 0.01
-
-    # 损失权重
-    lambda_pred: float = 0.1
-    lambda_entropy: float = 0.0  # 已关闭: L_entropy 过早推动 p_halt 二值化，τ退火已足够
-    lambda_ponder: float = 0.0  # ponder cost (已关闭: eff_iters→1 过快)
-    use_ponder_cost: bool = False  # 开关: 关闭 L_ponder 以避免压制迭代
-
-    # 推理温度 (控制推理强度)
-    inference_temperature: float = 1.0  # >1 → 更多迭代 (尤其 hard token); <1 → 更少迭代
+    # Entropy-based halt (v2)
+    lambda_mono: float = 0.1         # L_mono 权重
+    entropy_temp_scale: float = 0.5  # per-query temperature: temp = 1 - scale * H_norm
+    halt_entropy_threshold: float = 0.3  # 推理硬停止: mean(H_norm) < threshold → 停止
 
     # 训练
     learning_rate: float = 2e-5

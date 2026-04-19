@@ -28,10 +28,11 @@ DEFAULT_OUTPUT = "notebooks/cct_kaggle.ipynb"
 VERSION = "cct-kaggle-v2"
 
 # 默认 Kaggle 挂载路径
-DEFAULT_MODEL = "/kaggle/input/meta-llama-llama-3.2-1b"
-DEFAULT_DATA = "/kaggle/input/cct-prepacked-data"
-DEFAULT_CODE = "/kaggle/input/cct-code"
-DEFAULT_WHEELS = "/kaggle/input/cct-wheels"
+DEFAULT_MODEL = "/kaggle/input/datasets/wukeneth/llama-3-2-1b-base"
+DEFAULT_DATA = "/kaggle/input/datasets/wukeneth/cct-pretrain-data"
+DEFAULT_CODE = "/kaggle/input/datasets/wukeneth/cct-code"
+DEFAULT_WHEELS = "/kaggle/input/datasets/wukeneth/cct-wheels"
+DEFAULT_CHECKPOINT = ""  # 恢复训练时设置, 例如 "/kaggle/input/datasets/wukeneth/cct-checkpoint"
 
 
 def md(source: str) -> dict:
@@ -69,18 +70,21 @@ def cells_header() -> List[dict]:
 - **RotaryCycleEmbed**: phi 黄金比例旋转循环嵌入
 - **Cross-Layer Fusion**: 2x FFN 加宽 (donor 层知识融合)
 
-**Kaggle 挂载 (4 项)**:
+**Kaggle 挂载 (4+1 项)**:
 1. Model: 预训练模型 (Llama-3.2-1B)
 2. Dataset: 训练数据 (pre-packed 或 OpenHermes)
 3. Dataset: CCT 源代码
 4. Dataset: 离线 pip 依赖包
+5. (可选) Dataset: Checkpoint (恢复训练)
 
+**Checkpoint/Resume**: 每 500 步自动保存, 超时 (8h) 自动保存并退出
 **Settings**: GPU T4/P100, Internet OFF"""),
     ]
 
 
 def cells_mount_config(model_path: str, data_path: str,
-                       code_path: str, wheels_path: str) -> List[dict]:
+                       code_path: str, wheels_path: str,
+                       checkpoint_path: str = "") -> List[dict]:
     return [
         md("## 0. 挂载配置"),
         code(f"""\
@@ -93,6 +97,7 @@ MOUNT_MODEL  = '{model_path}'   # 预训练模型
 MOUNT_DATA   = '{data_path}'    # 训练数据
 MOUNT_CODE   = '{code_path}'    # CCT 源代码
 MOUNT_WHEELS = '{wheels_path}'  # 离线 pip 依赖
+MOUNT_CHECKPOINT = '{checkpoint_path}'  # 恢复训练 (留空=从头训练)
 
 # 验证挂载
 for name, path in [('Model', MOUNT_MODEL), ('Data', MOUNT_DATA),
@@ -112,10 +117,23 @@ print('\\n模型目录: %s' % MODEL_DIR)
 
 # 解析代码目录
 CODE_DIR = MOUNT_CODE
-if os.path.exists(os.path.join(MOUNT_CODE, 'src')):
+if os.path.exists(os.path.join(MOUNT_CODE, 'src', 'model')):
     CODE_DIR = MOUNT_CODE
 elif os.path.basename(MOUNT_CODE) == 'src':
     CODE_DIR = os.path.dirname(MOUNT_CODE)
+else:
+    for root, dirs, files in os.walk(MOUNT_CODE):
+        if 'wrapped_model.py' in files:
+            parent = os.path.dirname(root)
+            if os.path.basename(parent) == 'src':
+                CODE_DIR = os.path.dirname(parent)
+            else:
+                import tempfile
+                _tmpdir = tempfile.mkdtemp()
+                os.symlink(parent, os.path.join(_tmpdir, 'src'))
+                CODE_DIR = _tmpdir
+                print('创建 src symlink: %s → %s' % (os.path.join(_tmpdir, 'src'), parent))
+            break
 sys.path.insert(0, CODE_DIR)
 print('代码目录: %s' % CODE_DIR)
 
@@ -144,7 +162,25 @@ assert DATA_DIR or DATA_FILE, '数据路径无效: %s' % MOUNT_DATA
 if DATA_DIR:
     print('数据 (pre-packed): %s' % DATA_DIR)
 else:
-    print('数据 (JSON): %s' % DATA_FILE)"""),
+    print('数据 (JSON): %s' % DATA_FILE)
+
+# Checkpoint resume
+CHECKPOINT_FILE = None
+if MOUNT_CHECKPOINT and os.path.exists(MOUNT_CHECKPOINT):
+    import glob as _glob
+    ckpt_files = _glob.glob(os.path.join(MOUNT_CHECKPOINT, '**', 'latest_checkpoint.pt'), recursive=True)
+    if ckpt_files:
+        CHECKPOINT_FILE = ckpt_files[0]
+        print('✓ Checkpoint: %s' % CHECKPOINT_FILE)
+    elif os.path.isfile(MOUNT_CHECKPOINT):
+        CHECKPOINT_FILE = MOUNT_CHECKPOINT
+        print('✓ Checkpoint: %s' % CHECKPOINT_FILE)
+    else:
+        print('⚠ Checkpoint 路径存在但无 latest_checkpoint.pt: %s' % MOUNT_CHECKPOINT)
+elif MOUNT_CHECKPOINT:
+    print('✗ Checkpoint 路径不存在: %s (从头训练)' % MOUNT_CHECKPOINT)
+else:
+    print('ℹ 从头训练 (无 checkpoint)')"""),
     ]
 
 
@@ -199,22 +235,24 @@ from torch.utils.data import DataLoader, Dataset, random_split
 
 from src.model.wrapped_model import CCTLlamaModel
 from src.model.column_config import CCTConfig
-from src.training.scheduler import compute_halt_tau, get_cosine_schedule_with_warmup
+from src.training.scheduler import get_cosine_schedule_with_warmup
 
 # === 超参数 ===
 CFG = {
-    'max_steps': 3800,
-    'batch_size': 32,
+    'max_steps': None,    # None = 自动按数据量算 (1 epoch)
+    'batch_size': 16,
     'grad_accum': 4,
     'max_seq_len': 2048,
-    'lr': 1e-4,
+    'lr': 2e-5,
     'new_lr': 5e-4,
     'max_grad_norm': 1.0,
     'weight_decay': 0.01,
     'warmup_steps': 200,
-    'log_interval': 20,
+    'log_interval': 5,
     'eval_interval': 200,
     'eval_chunks': 100,
+    'save_interval': 500,     # checkpoint 保存间隔 (步数)
+    'max_train_hours': 8.0,   # 超时自动保存并停止
 }
 
 # === 数据加载 ===
@@ -253,7 +291,7 @@ if DATA_DIR:
 else:
     # OpenHermes JSON fallback
     print('Loading OpenHermes JSON: %s' % DATA_FILE)
-    from datasets import load_dataset
+    import json as _json
     from transformers import AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR, trust_remote_code=True)
@@ -311,7 +349,19 @@ else:
             if prompt_len > 0: labels[:prompt_len] = -100
             return {'input_ids': input_ids, 'attention_mask': attn, 'labels': labels}
 
-    raw = load_dataset('json', data_files=DATA_FILE, split='train')
+    import json as _json
+    raw = []
+    with open(DATA_FILE, 'r', encoding='utf-8') as _f:
+        first = _f.read(2).strip()
+        _f.seek(0)
+        if first.startswith('['):
+            raw = _json.load(_f)
+        else:
+            for line in _f:
+                line = line.strip()
+                if line:
+                    raw.append(_json.loads(line))
+    print('数据量: %d' % len(raw))
     full_ds = SFTDataset(raw, tokenizer, max_length=512)
     eval_sz = int(len(full_ds) * 0.05)
     train_ds, eval_ds = random_split(full_ds, [len(full_ds) - eval_sz, eval_sz])
@@ -319,7 +369,27 @@ else:
     print('Train: %d, Eval: %d' % (len(train_ds), len(eval_data)))
     train_files = None
 
-eval_loader = DataLoader(ListDataset(eval_data), batch_size=CFG['batch_size'], num_workers=0)"""),
+eval_loader = DataLoader(ListDataset(eval_data), batch_size=CFG['batch_size'], num_workers=0)
+
+# === 自动计算 max_steps ===
+eff_batch = CFG['batch_size'] * CFG['grad_accum']
+if train_files is not None:
+    sample0 = torch.load(train_files[0], weights_only=False)
+    chunks_per_file = len(sample0)
+    del sample0
+    total_chunks = len(train_files) * chunks_per_file
+    CFG['max_steps'] = total_chunks // eff_batch
+    total_tokens = CFG['max_steps'] * eff_batch * CFG['max_seq_len']
+    print('Auto max_steps: %d files × %d chunks = %d chunks → %d steps (%.2fB tokens, 1 epoch)' % (
+        len(train_files), chunks_per_file, total_chunks, CFG['max_steps'], total_tokens / 1e9))
+elif train_files is None and CFG['max_steps'] is None:
+    total_steps_ds = len(train_ds) // eff_batch
+    CFG['max_steps'] = total_steps_ds
+    print('Auto max_steps: %d samples / %d = %d steps' % (len(train_ds), eff_batch, CFG['max_steps']))
+
+if CFG['warmup_steps'] > CFG['max_steps'] // 5:
+    CFG['warmup_steps'] = max(CFG['max_steps'] // 10, 10)
+    print('Adjusted warmup to %d' % CFG['warmup_steps'])"""),
     ]
 
 
@@ -333,15 +403,13 @@ from transformers import LlamaForCausalLM
 DTYPE = torch.bfloat16
 
 cct_config = CCTConfig(
-    max_iter=5,
-    lambda_pred=0.1,
-    lambda_entropy=0.0,
-    lambda_ponder=0.0,
-    use_ponder_cost=False,
-    use_ffn_expansion=True,   # 启用 Cross-Layer Fusion
-    column_d_ff=16384,        # 2x FFN 加宽
-    widen_mode='cross',
-    donor_init_scale=0.1,
+    max_iter=10,
+    lambda_mono=0.1,
+    entropy_temp_scale=0.5,
+    halt_entropy_threshold=0.3,
+    use_ffn_expansion=False,
+    use_fusion_graft=True,
+    fusion_rank=64,
     bf16=True,
     gradient_checkpointing=True,
     max_seq_len=CFG['max_seq_len'],
@@ -367,10 +435,156 @@ torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 torch.set_float32_matmul_precision('high')
 
-print(model.get_trainable_params_info())
+# torch.compile (训练时 column 循环固定 max_iter 次, 可以 compile)
+USE_COMPILE = False
+if USE_COMPILE:
+    try:
+        model = torch.compile(model, mode='reduce-overhead')
+        print('torch.compile: ON (reduce-overhead)')
+    except Exception as e:
+        print('torch.compile 失败, 跳过: %s' % e)
+        USE_COMPILE = False
+
+print(model.get_trainable_params_info() if not USE_COMPILE else
+      'Params: compiled model (run forward to see stats)')
 print('Column layers: %d, Max iter: %d, seq_len: %d' % (
     len(cct_config.pretrained_column_layers), cct_config.max_iter, CFG['max_seq_len']))
-print('SDPA enabled, TF32 matmul enabled')"""),
+print('SDPA + TF32 + compile=%s' % USE_COMPILE)
+
+# Flash Attention 诊断
+_fa_ok = torch.backends.cuda.flash_sdp_enabled()
+_mem_eff = torch.backends.cuda.mem_efficient_sdp_enabled()
+_math = torch.backends.cuda.math_sdp_enabled()
+print('\\n=== SDPA Backends ===')
+print('  Flash SDP:        %s' % ('✓' if _fa_ok else '✗'))
+print('  Mem-efficient SDP: %s' % ('✓' if _mem_eff else '✗'))
+print('  Math SDP:         %s' % ('✓' if _math else '✗'))
+# Column attention 走 is_causal=True → Flash SDP (如果 GPU 支持)
+if _fa_ok:
+    print('Column layers 将使用 Flash Attention (is_causal=True)')
+elif _mem_eff:
+    print('Column layers 将使用 Memory-Efficient Attention')
+else:
+    print('⚠ 仅 Math backend 可用, 性能较低')"""),
+    ]
+
+
+def cells_vram_profile() -> List[dict]:
+    return [
+        md("## 1.8 VRAM 诊断 (可选)"),
+        code("""\
+# === VRAM 诊断 — 设 RUN_VRAM_PROFILE=True 开启 ===
+RUN_VRAM_PROFILE = False
+
+if RUN_VRAM_PROFILE:
+    import torch, gc
+
+    def _mb(b): return b / 1024**2
+    def _gb(b): return b / 1024**3
+    def _vram():
+        return torch.cuda.memory_allocated(), torch.cuda.max_memory_allocated()
+
+    torch.cuda.reset_peak_memory_stats()
+    gc.collect(); torch.cuda.empty_cache()
+
+    a0, _ = _vram()
+    print('=== VRAM 诊断 ===')
+    print('[0] Model on GPU: %.1f MB' % _mb(a0))
+
+    # --- 模拟一次 forward ---
+    bs_test = CFG['batch_size']
+    sl = CFG['max_seq_len']
+    print('\\n[1] Forward pass (bs=%d, seq=%d)...' % (bs_test, sl))
+
+    dummy_ids = torch.randint(0, 32000, (bs_test, sl), device='cuda')
+    dummy_mask = torch.ones(bs_test, sl, dtype=torch.long, device='cuda')
+    dummy_labels = dummy_ids.clone()
+
+    model.train()
+    torch.cuda.reset_peak_memory_stats()
+    a_pre, _ = _vram()
+
+    with torch.amp.autocast('cuda', dtype=DTYPE):
+        out = model(input_ids=dummy_ids, attention_mask=dummy_mask, labels=dummy_labels)
+    loss = out['loss']
+
+    a_fwd, peak_fwd = _vram()
+    print('  Allocated after fwd: %.1f MB (delta: +%.1f MB)' % (_mb(a_fwd), _mb(a_fwd - a_pre)))
+    print('  Peak during fwd:     %.1f MB' % _mb(peak_fwd))
+
+    # --- backward ---
+    print('\\n[2] Backward pass...')
+    torch.cuda.reset_peak_memory_stats()
+    a_pre_bwd, _ = _vram()
+    loss.backward()
+    a_bwd, peak_bwd = _vram()
+    print('  Allocated after bwd: %.1f MB (delta: +%.1f MB)' % (_mb(a_bwd), _mb(a_bwd - a_pre_bwd)))
+    print('  Peak during bwd:     %.1f MB' % _mb(peak_bwd))
+
+    # --- 清理 ---
+    del out, loss, dummy_ids, dummy_mask, dummy_labels
+    model.zero_grad(set_to_none=True)
+    gc.collect(); torch.cuda.empty_cache()
+
+    a_clean, _ = _vram()
+    print('\\n[3] After cleanup: %.1f MB' % _mb(a_clean))
+
+    # --- 总结 ---
+    print('\\n=== 总结 ===')
+    print('Model static:          %.2f GB' % _gb(a0))
+    print('Forward peak:          %.2f GB' % _gb(peak_fwd))
+    print('Backward peak:         %.2f GB' % _gb(peak_bwd))
+    print('Gradient checkpointing: %s' % ('ON' if model._gradient_checkpointing else 'OFF'))
+    print('Config: bs=%d, seq=%d, max_iter=%d, grad_ckpt=%s' % (
+        bs_test, sl, cct_config.max_iter, model._gradient_checkpointing))
+
+    # --- 预估 optimizer 开销 ---
+    n_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    optim_est = n_params * 2 * 4  # AdamW: m + v in fp32
+    print('\\nOptimizer states est:  %.2f GB (AdamW fp32 m+v for %dM params)' % (
+        _gb(optim_est), n_params // 1_000_000))
+    print('Predicted total peak:  %.2f GB' % _gb(peak_bwd + optim_est))
+    print()
+    if peak_bwd + optim_est > 90e9:
+        print('⚠ 预计超 90 GB! 建议减小 batch_size 或 max_iter')
+    else:
+        print('✓ 预计 %.1f GB, 在 %.0f GB GPU 内' % (_gb(peak_bwd + optim_est),
+              torch.cuda.get_device_properties(0).total_memory / 1e9))
+else:
+    print('VRAM 诊断已跳过 (设 RUN_VRAM_PROFILE=True 开启)')"""),
+    ]
+
+
+def cells_vram_cleanup() -> List[dict]:
+    return [
+        md("### 🧹 显存清理"),
+        code("""\
+# === 显存清理 (训练前/切换任务时运行) ===
+import gc, torch
+
+# 清理所有临时变量
+for _name in list(globals()):
+    _obj = globals()[_name]
+    if isinstance(_obj, torch.Tensor) and _name not in ('model',):
+        if _obj.is_cuda and _name.startswith(('dummy_', 'out', 'loss')):
+            del globals()[_name]
+
+# 清零梯度
+if 'model' in dir():
+    model.zero_grad(set_to_none=True)
+
+# 清理 optimizer 状态 (如果需要重建 optimizer)
+if 'optimizer' in dir():
+    optimizer.zero_grad(set_to_none=True)
+
+gc.collect()
+torch.cuda.empty_cache()
+torch.cuda.reset_peak_memory_stats()
+
+_alloc = torch.cuda.memory_allocated() / 1024**3
+_resv  = torch.cuda.memory_reserved() / 1024**3
+_total = torch.cuda.get_device_properties(0).total_memory / 1024**3
+print(f'Allocated: {_alloc:.2f} GB | Reserved: {_resv:.2f} GB | Free: {_total - _resv:.2f} GB | Total: {_total:.1f} GB')"""),
     ]
 
 
@@ -399,7 +613,43 @@ best_eval = float('inf')
 eff_batch = CFG['batch_size'] * CFG['grad_accum']
 tokens_per_step = eff_batch * CFG['max_seq_len']
 print('Effective batch: %d seqs = %dK tokens/step' % (eff_batch, tokens_per_step // 1000))
-print('Total: %d steps = %.2fB tokens' % (CFG['max_steps'], CFG['max_steps'] * tokens_per_step / 1e9))"""),
+print('Total: %d steps = %.2fB tokens' % (CFG['max_steps'], CFG['max_steps'] * tokens_per_step / 1e9))
+
+# === Checkpoint Resume ===
+import random, numpy as np
+start_step = 0
+resume_file_idx = 0
+
+if CHECKPOINT_FILE and os.path.exists(CHECKPOINT_FILE):
+    print('\\nLoading checkpoint: %s' % CHECKPOINT_FILE)
+    _ckpt = torch.load(CHECKPOINT_FILE, weights_only=False, map_location='cpu')
+    # 验证配置兼容性
+    for _key in ['max_steps', 'warmup_steps', 'grad_accum']:
+        _ckpt_v = _ckpt.get(_key)
+        _curr_v = CFG.get(_key)
+        if _ckpt_v and _ckpt_v != _curr_v:
+            print('⚠ %s 不匹配 (ckpt=%s, current=%s)' % (_key, _ckpt_v, _curr_v))
+    model.load_state_dict(_ckpt['model_state'])
+    optimizer.load_state_dict(_ckpt['optimizer_state'])
+    lr_sched.load_state_dict(_ckpt['lr_sched_state'])
+    start_step = _ckpt['step']
+    resume_file_idx = _ckpt.get('file_idx', start_step * CFG['grad_accum'])
+    best_eval = _ckpt.get('best_eval', float('inf'))
+    # RNG 状态恢复
+    if 'rng_torch' in _ckpt:
+        torch.set_rng_state(_ckpt['rng_torch'])
+    if 'rng_cuda' in _ckpt:
+        torch.cuda.set_rng_state(_ckpt['rng_cuda'])
+    if 'rng_python' in _ckpt:
+        random.setstate(_ckpt['rng_python'])
+    if 'rng_numpy' in _ckpt:
+        np.random.set_state(_ckpt['rng_numpy'])
+    print('✓ 从 step %d 恢复 (best_eval=%.4f, file_idx=%d)' % (start_step, best_eval, resume_file_idx))
+    _prev_loss = _ckpt.get('last_train_loss', '?')
+    print('  上次训练 loss: %s' % _prev_loss)
+    del _ckpt; gc.collect(); torch.cuda.empty_cache()
+else:
+    print('\\n从头开始训练 (step 0)')"""),
     ]
 
 
@@ -407,36 +657,100 @@ def cells_train_loop() -> List[dict]:
     return [
         code("""\
 # === 训练循环 ===
-import time as _time, glob
+import time as _time, glob, random, numpy as np
+import threading
+
+_save_thread = None
+_save_error = None
+
+def _deep_copy_to_cpu(obj):
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().cpu().clone()
+    elif isinstance(obj, dict):
+        return {k: _deep_copy_to_cpu(v) for k, v in obj.items()}
+    elif isinstance(obj, (list, tuple)):
+        return type(obj)(_deep_copy_to_cpu(v) for v in obj)
+    return obj
+
+def save_checkpoint(model, optimizer, lr_sched, step, file_idx, best_eval, last_loss, path, block=False):
+    global _save_thread, _save_error
+    # 检查上一次异步保存
+    if _save_thread is not None and _save_thread.is_alive():
+        _save_thread.join()
+    if _save_error is not None:
+        print('  ⚠ 上次 checkpoint 保存失败: %s' % _save_error)
+        _save_error = None
+    # 快速拷贝所有状态到 CPU
+    _t_snap = _time.time()
+    ckpt = {
+        'step': step,
+        'file_idx': file_idx,
+        'best_eval': best_eval,
+        'last_train_loss': last_loss,
+        'max_steps': CFG['max_steps'],
+        'warmup_steps': CFG['warmup_steps'],
+        'grad_accum': CFG['grad_accum'],
+        'model_state': {k: v.detach().cpu().clone() for k, v in model.state_dict().items()},
+        'optimizer_state': _deep_copy_to_cpu(optimizer.state_dict()),
+        'lr_sched_state': lr_sched.state_dict(),
+        'rng_torch': torch.get_rng_state(),
+        'rng_cuda': torch.cuda.get_rng_state(),
+        'rng_python': random.getstate(),
+        'rng_numpy': np.random.get_state(),
+    }
+    snap_s = _time.time() - _t_snap
+    def _write(ckpt, path, step, snap_s):
+        global _save_error
+        try:
+            _t_w = _time.time()
+            tmp_path = path + '.tmp'
+            torch.save(ckpt, tmp_path)
+            os.replace(tmp_path, path)
+            size_mb = os.path.getsize(path) / 1e6
+            print('  💾 Checkpoint saved: step %d (snap %.1fs + write %.1fs, %.0f MB)' % (
+                step, snap_s, _time.time() - _t_w, size_mb))
+        except Exception as e:
+            _save_error = str(e)
+            print('  ❌ Checkpoint 保存失败: %s' % e)
+    if block:
+        _write(ckpt, path, step, snap_s)
+    else:
+        _save_thread = threading.Thread(target=_write, args=(ckpt, path, step, snap_s), daemon=True)
+        _save_thread.start()
 
 model.train()
 _t0 = _time.time()
 max_steps = CFG['max_steps']
-print('Training for %d optimizer steps (grad_accum=%d)...' % (max_steps, CFG['grad_accum']))
+save_interval = CFG['save_interval']
+max_hours = CFG['max_train_hours']
+ckpt_path = '/kaggle/working/output/latest_checkpoint.pt'
 
-avg = {'total': 0, 'lm': 0, 'pred': 0, 'eff_iters': 0, 'eff_std': 0, 'score_std': 0}
+if start_step > 0:
+    print('Resuming from step %d/%d (grad_accum=%d)...' % (start_step, max_steps, CFG['grad_accum']))
+else:
+    print('Training for %d optimizer steps (grad_accum=%d)...' % (max_steps, CFG['grad_accum']))
+
+avg = {'total': 0, 'lm': 0, 'mono': 0, 'entropy': 0, 'iters': 0}
 avg_n = 0
+_last_loss = 0.0
+_timeout_exit = False
 
 if train_files is not None:
     # === Pre-packed 数据路径 ===
-    file_idx = 0
-    for gs in range(max_steps):
-        tau_halt = compute_halt_tau(gs, max_steps,
-                                    cct_config.halt_tau_start, cct_config.halt_tau_end)
-        model.set_halt_tau(tau_halt)
+    file_idx = resume_file_idx % len(train_files) if resume_file_idx else 0
+    for gs in range(start_step, max_steps):
 
         for _micro in range(CFG['grad_accum']):
             if file_idx >= len(train_files):
-                file_idx = 0  # 循环
+                file_idx = 0
                 print('[Step %d] Train data exhausted, restarting from file 0' % gs)
 
             batch_data = torch.load(train_files[file_idx], weights_only=False)
             file_idx += 1
 
-            # 从 file 中取 batch_size 个 chunks
-            loader_tmp = DataLoader(ListDataset(batch_data),
+            batch_loader = DataLoader(ListDataset(batch_data),
                                     batch_size=CFG['batch_size'], shuffle=True)
-            batch = next(iter(loader_tmp))
+            batch = next(iter(batch_loader))
             batch = {k: v.to(device) for k, v in batch.items()}
 
             with torch.amp.autocast('cuda', dtype=DTYPE):
@@ -449,10 +763,9 @@ if train_files is not None:
             ld = out['loss_dict']
             avg['total'] += ld.get('loss_total', 0)
             avg['lm'] += ld.get('loss_lm', 0)
-            avg['pred'] += ld.get('loss_pred', 0)
-            avg['eff_iters'] += out.get('effective_iters', 0)
-            avg['eff_std'] += out.get('eff_iters_std', 0)
-            avg['score_std'] += out.get('score_std', 0)
+            avg['mono'] += ld.get('loss_mono', 0)
+            avg['entropy'] += out.get('mean_entropy', 0)
+            avg['iters'] += out.get('num_iterations', 0)
             avg_n += 1
 
         torch.nn.utils.clip_grad_norm_(model.parameters(), CFG['max_grad_norm'])
@@ -461,17 +774,27 @@ if train_files is not None:
         if (gs + 1) % CFG['log_interval'] == 0:
             n = max(avg_n, 1)
             elapsed = _time.time() - _t0
-            eta_m = (elapsed / (gs + 1)) * (max_steps - gs - 1) / 60
+            eta_m = (elapsed / (gs + 1 - start_step)) * (max_steps - gs - 1) / 60
             tokens_done = (gs + 1) * eff_batch * CFG['max_seq_len']
-            print('[Step %d/%d] loss=%.4f | lm=%.4f pred=%.4f | '
-                  'eff=%.2f+/-%.2f score_std=%.4f tau=%.3f | '
+            _last_loss = avg['total'] / n
+            print('[Step %d/%d] loss=%.4f | lm=%.4f mono=%.4f | '
+                  'H=%.3f iters=%d | '
                   'lr=%.2e | %.1fM tok | ETA %.0fm' % (
-                gs + 1, max_steps, avg['total']/n, avg['lm']/n, avg['pred']/n,
-                avg['eff_iters']/n, avg['eff_std']/n, avg['score_std']/n, tau_halt,
+                gs + 1, max_steps, avg['total']/n, avg['lm']/n, avg['mono']/n,
+                avg['entropy']/n, avg['iters']/n,
                 optimizer.param_groups[0]['lr'], tokens_done / 1e6, eta_m))
-            avg = {'total': 0, 'lm': 0, 'pred': 0, 'eff_iters': 0, 'eff_std': 0, 'score_std': 0}
+            avg = {'total': 0, 'lm': 0, 'mono': 0, 'entropy': 0, 'iters': 0}
             avg_n = 0
 
+        # === 超时检查 (eval 前) ===
+        _elapsed_h = (_time.time() - _t0) / 3600
+        if _elapsed_h >= max_hours:
+            print('\\n⏰ 超时 (%.1f h >= %.1f h), 保存 checkpoint 并退出...' % (_elapsed_h, max_hours))
+            save_checkpoint(model, optimizer, lr_sched, gs + 1, file_idx, best_eval, _last_loss, ckpt_path, block=True)
+            _timeout_exit = True
+            break
+
+        # === 定期 Eval ===
         if (gs + 1) % CFG['eval_interval'] == 0:
             model.eval()
             ev_loss, ev_n = 0, 0
@@ -492,6 +815,10 @@ if train_files is not None:
                 print('  New best!')
             model.train()
 
+        # === 定期 Checkpoint ===
+        if (gs + 1) == start_step + 10 or (gs + 1) % save_interval == 0:
+            save_checkpoint(model, optimizer, lr_sched, gs + 1, file_idx, best_eval, _last_loss, ckpt_path)
+
 else:
     # === OpenHermes DataLoader 路径 ===
     train_loader = DataLoader(train_ds, batch_size=CFG['batch_size'],
@@ -500,19 +827,16 @@ else:
     max_steps = min(max_steps, total_steps_ds)
     print('OpenHermes mode: %d steps' % max_steps)
 
-    gs_count = 0
+    gs_count = start_step
     for epoch in range(10):
         for bi, batch in enumerate(train_loader):
             if gs_count >= max_steps: break
             batch = {k: v.to(device) for k, v in batch.items()}
-            tau_halt = compute_halt_tau(gs_count, max_steps,
-                                        cct_config.halt_tau_start, cct_config.halt_tau_end)
-            model.set_halt_tau(tau_halt)
             with torch.amp.autocast('cuda', dtype=DTYPE):
                 out = model(input_ids=batch['input_ids'],
                            attention_mask=batch['attention_mask'],
                            labels=batch['labels'])
-            loss = out.loss / CFG['grad_accum']
+            loss = out['loss'] / CFG['grad_accum']
             loss.backward()
             if (bi + 1) % CFG['grad_accum'] == 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), CFG['max_grad_norm'])
@@ -521,16 +845,31 @@ else:
                 ld = out['loss_dict']
                 avg['total'] += ld.get('loss_total', 0)
                 avg['lm'] += ld.get('loss_lm', 0)
-                avg['pred'] += ld.get('loss_pred', 0)
-                avg['eff_iters'] += out.get('effective_iters', 0)
+                avg['mono'] += ld.get('loss_mono', 0)
+                avg['entropy'] += out.get('mean_entropy', 0)
+                avg['iters'] += out.get('num_iterations', 0)
                 avg_n += 1
                 if gs_count % CFG['log_interval'] == 0:
                     n = max(avg_n, 1)
-                    print('[Step %d/%d] loss=%.4f lm=%.4f pred=%.4f eff=%.2f tau=%.3f' % (
+                    elapsed = _time.time() - _t0
+                    eta_m = (elapsed / (gs_count - start_step)) * (max_steps - gs_count) / 60 if gs_count > start_step else 0
+                    tokens_done = gs_count * eff_batch * CFG['max_seq_len']
+                    _last_loss = avg['total'] / n
+                    print('[Step %d/%d] loss=%.4f | lm=%.4f mono=%.4f | '
+                          'H=%.3f iters=%d | '
+                          'lr=%.2e | %.1fM tok | ETA %.0fm' % (
                         gs_count, max_steps, avg['total']/n, avg['lm']/n,
-                        avg['pred']/n, avg['eff_iters']/n, tau_halt))
-                    avg = {'total': 0, 'lm': 0, 'pred': 0, 'eff_iters': 0, 'eff_std': 0, 'score_std': 0}
+                        avg['mono']/n, avg['entropy']/n, avg['iters']/n,
+                        optimizer.param_groups[0]['lr'], tokens_done / 1e6, eta_m))
+                    avg = {'total': 0, 'lm': 0, 'mono': 0, 'entropy': 0, 'iters': 0}
                     avg_n = 0
+                # 超时检查
+                _elapsed_h = (_time.time() - _t0) / 3600
+                if _elapsed_h >= max_hours:
+                    print('\\n⏰ 超时 (%.1f h >= %.1f h), 保存 checkpoint 并退出...' % (_elapsed_h, max_hours))
+                    save_checkpoint(model, optimizer, lr_sched, gs_count, 0, best_eval, _last_loss, ckpt_path, block=True)
+                    _timeout_exit = True
+                    break
                 if gs_count % CFG['eval_interval'] == 0:
                     model.eval()
                     ev_loss, ev_n = 0, 0
@@ -541,7 +880,7 @@ else:
                                 eo = model(input_ids=eb['input_ids'],
                                           attention_mask=eb['attention_mask'],
                                           labels=eb['labels'])
-                            ev_loss += eo.loss.item(); ev_n += 1
+                            ev_loss += eo['loss_dict'].get('loss_lm', 0); ev_n += 1
                     avg_ev = ev_loss / max(ev_n, 1)
                     ppl = math.exp(min(avg_ev, 20))
                     print('  [Eval] loss=%.4f PPL=%.2f' % (avg_ev, ppl))
@@ -550,10 +889,31 @@ else:
                         torch.save(model.state_dict(), '/kaggle/working/output/best_model.pt')
                         print('  New best!')
                     model.train()
+                if gs_count == start_step + 10 or gs_count % save_interval == 0:
+                    save_checkpoint(model, optimizer, lr_sched, gs_count, 0, best_eval, _last_loss, ckpt_path)
+        if gs_count >= max_steps or _timeout_exit: break
 
-torch.save(model.state_dict(), '/kaggle/working/output/final_model.pt')
-print('\\nTraining complete! Best eval loss: %.4f (%.1f min total)' % (
-    best_eval, (_time.time() - _t0) / 60))"""),
+# 等待异步保存完成
+if _save_thread is not None and _save_thread.is_alive():
+    print('等待 checkpoint 写入完成...')
+    _save_thread.join()
+if _save_error is not None:
+    print('⚠ 最后一次 checkpoint 保存失败: %s' % _save_error)
+    print('  尝试同步保存...')
+    save_checkpoint(model, optimizer, lr_sched,
+                    gs + 1 if train_files else gs_count,
+                    file_idx if train_files else 0,
+                    best_eval, _last_loss, ckpt_path, block=True)
+
+if not _timeout_exit:
+    torch.save(model.state_dict(), '/kaggle/working/output/final_model.pt')
+    print('\\nTraining complete! Best eval loss: %.4f (%.1f min total)' % (
+        best_eval, (_time.time() - _t0) / 60))
+else:
+    print('\\n训练因超时中断 (step %d/%d). 下次运行时:' % (gs + 1 if train_files else gs_count, max_steps))
+    print('1. 将 /kaggle/working/output/ 上传为 Kaggle Dataset')
+    print('2. 设置 MOUNT_CHECKPOINT 指向该 dataset 路径')
+    print('3. 重新运行 notebook 即可自动恢复')"""),
     ]
 
 
@@ -567,7 +927,7 @@ model.eval()
 def evaluate(model, data_list, batch_size=32):
     loader = DataLoader(ListDataset(data_list), batch_size=batch_size, num_workers=0)
     total_loss, count = 0, 0
-    all_eff_iters, all_num_iters = [], []
+    all_num_iters, all_entropy = [], []
     with torch.no_grad():
         for batch in loader:
             batch = {k: v.to(device) for k, v in batch.items()}
@@ -576,36 +936,150 @@ def evaluate(model, data_list, batch_size=32):
                            attention_mask=batch['attention_mask'],
                            labels=batch['labels'])
             total_loss += out['loss_dict'].get('loss_lm', 0)
-            all_eff_iters.append(out.get('effective_iters', 0))
             all_num_iters.append(out.get('num_iterations', 0))
+            all_entropy.append(out.get('mean_entropy', 0))
             count += 1
     avg = total_loss / max(count, 1)
-    avg_eff = sum(all_eff_iters) / max(len(all_eff_iters), 1)
-    avg_num = sum(all_num_iters) / max(len(all_num_iters), 1)
-    return avg, math.exp(min(avg, 20)), avg_eff, avg_num
+    avg_iters = sum(all_num_iters) / max(len(all_num_iters), 1)
+    avg_ent = sum(all_entropy) / max(len(all_entropy), 1)
+    return avg, math.exp(min(avg, 20)), avg_iters, avg_ent
 
-model.set_halt_tau(cct_config.halt_tau_end)
 model.train()
-tl, tp, tei, tni = evaluate(model, eval_data, CFG['batch_size'])
+tl, tp, tni, teh = evaluate(model, eval_data, CFG['batch_size'])
 
 model.eval()
-il, ip, iei, ini = evaluate(model, eval_data, CFG['batch_size'])
+il, ip, ini, ieh = evaluate(model, eval_data, CFG['batch_size'])
 
 print()
 print('=' * 70)
-print('| Mode  | LM Loss | PPL    | Eff Iters | Num Iters | Loss Gap |')
-print('|-------|---------|--------|-----------|-----------|----------|')
-print('| Train | %.4f  | %6.2f | %.2f      | %.1f       | -        |' % (tl, tp, tei, tni))
-print('| Infer | %.4f  | %6.2f | %.2f      | %.1f       | %+.4f   |' % (il, ip, iei, ini, il - tl))
+print('| Mode  | LM Loss | PPL    | Iters | H_norm | Loss Gap |')
+print('|-------|---------|--------|-------|--------|----------|')
+print('| Train | %.4f  | %6.2f | %d     | %.3f  | -        |' % (tl, tp, tni, teh))
+print('| Infer | %.4f  | %6.2f | %d     | %.3f  | %+.4f   |' % (il, ip, ini, ieh, il - tl))
 print('=' * 70)"""),
     ]
 
 
 def cells_output() -> List[dict]:
     return [
-        md("## 4. 输出保存"),
+        md("## 4. 推理测试 + 可视化"),
         code("""\
-# === 4. 保存输出 ===
+# === 4a. 推理测试 ===
+model.eval()
+
+@torch.no_grad()
+def greedy_generate(model, input_ids, max_new_tokens=128):
+    ids = input_ids.clone()
+    for _ in range(max_new_tokens):
+        if ids.size(1) > CFG['max_seq_len']:
+            ids = ids[:, -CFG['max_seq_len']:]
+        with torch.amp.autocast('cuda', dtype=DTYPE):
+            out = model(input_ids=ids)
+        next_id = out['logits'][:, -1, :].argmax(dim=-1, keepdim=True)
+        ids = torch.cat([ids, next_id], dim=1)
+        if next_id.item() == tokenizer.eos_token_id:
+            break
+    return ids
+
+import random
+random.seed(42)
+n_samples = min(5, len(eval_data))
+sample_indices = random.sample(range(len(eval_data)), n_samples)
+
+print('=' * 80)
+print('推理测试: eval 数据前 256 tokens 做 prompt, 续写 128 tokens')
+print('=' * 80)
+
+for idx_i, si in enumerate(sample_indices):
+    input_ids = eval_data[si]['input_ids']
+    prompt_len = min(256, input_ids.size(0) // 2)
+    prompt_ids = input_ids[:prompt_len].unsqueeze(0).to(device)
+    gt_ids = input_ids[prompt_len:prompt_len + 128]
+    gt_text = tokenizer.decode(gt_ids, skip_special_tokens=True)
+
+    gen_ids = greedy_generate(model, prompt_ids, max_new_tokens=128)
+    gen_text = tokenizer.decode(gen_ids[0][prompt_len:], skip_special_tokens=True)
+    prompt_text = tokenizer.decode(prompt_ids[0], skip_special_tokens=True)
+
+    print('\\n--- Sample %d (eval idx=%d) ---' % (idx_i + 1, si))
+    print('[PROMPT last 200 chars] ...%s' % prompt_text[-200:])
+    print('[GROUND TRUTH] %s' % gt_text[:300])
+    print('[MODEL OUTPUT] %s' % gen_text[:300])
+    print()"""),
+
+        code("""\
+# === 4b. 可视化: Score + Precision + Eff Iters 分布 ===
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import numpy as np
+
+model.eval()
+all_scores_viz = []
+all_eff_iters_viz = []
+
+viz_loader = DataLoader(ListDataset(eval_data), batch_size=CFG['batch_size'], num_workers=0)
+with torch.no_grad():
+    for bi, batch in enumerate(viz_loader):
+        if bi >= 20: break
+        batch = {k: v.to(device) for k, v in batch.items()}
+        with torch.amp.autocast('cuda', dtype=DTYPE):
+            out = model(input_ids=batch['input_ids'],
+                       attention_mask=batch['attention_mask'],
+                       labels=batch['labels'])
+        if out.get('scores'):
+            all_scores_viz.append(out['scores'][-1].float().cpu())
+        if out.get('p_halts'):
+            p_halts_cpu = [ph.float().cpu() for ph in out['p_halts']]
+            remainder = torch.ones_like(p_halts_cpu[0])
+            eff = torch.zeros_like(p_halts_cpu[0])
+            for k, ph in enumerate(p_halts_cpu):
+                eff += (k + 1) * remainder * ph
+                remainder = remainder * (1.0 - ph)
+            eff += len(p_halts_cpu) * remainder
+            mask = batch['attention_mask'][:, :eff.size(1)].cpu()
+            eff_tokens = eff[mask.bool()].numpy()
+            all_eff_iters_viz.append(eff_tokens)
+
+fig, axes = plt.subplots(1, 3, figsize=(15, 4))
+
+if all_scores_viz:
+    scores_flat = torch.cat(all_scores_viz).flatten().numpy()
+    axes[0].hist(scores_flat, bins=50, alpha=0.7, color='steelblue')
+    axes[0].set_title('Prediction Score Distribution')
+    axes[0].set_xlabel('cosine similarity')
+    axes[0].axvline(x=np.mean(scores_flat), color='red', ls='--',
+                    label='mean=%.3f' % np.mean(scores_flat))
+    axes[0].legend()
+
+    tau_p = cct_config.precision_temperature
+    precision = 1.0 - 1.0 / (1.0 + np.exp(-scores_flat / tau_p))
+    axes[1].hist(precision, bins=50, alpha=0.7, color='coral')
+    axes[1].set_title('Precision Distribution (tau_p=%.2f)' % tau_p)
+    axes[1].set_xlabel('precision = 1 - sigma(score/tau)')
+    axes[1].axvline(x=np.mean(precision), color='red', ls='--',
+                    label='mean=%.3f' % np.mean(precision))
+    axes[1].legend()
+
+if all_eff_iters_viz:
+    eff_flat = np.concatenate(all_eff_iters_viz)
+    axes[2].hist(eff_flat, bins=50, alpha=0.7, color='seagreen')
+    axes[2].set_title('Per-Token Effective Iterations (N=%d)' % len(eff_flat))
+    axes[2].set_xlabel('effective iterations')
+    mean_eff = np.mean(eff_flat)
+    std_eff = np.std(eff_flat)
+    axes[2].axvline(x=mean_eff, color='red', ls='--',
+                    label='mean=%.2f+/-%.2f' % (mean_eff, std_eff))
+    axes[2].legend()
+
+plt.tight_layout()
+plt.savefig('/kaggle/working/output/viz_distributions.png', dpi=150)
+plt.show()
+print('Saved to /kaggle/working/output/viz_distributions.png')"""),
+
+        md("## 5. 输出保存"),
+        code("""\
+# === 5. 保存输出 ===
 import shutil
 
 output_dir = '/kaggle/working/output'
@@ -623,14 +1097,17 @@ print('\\nDone! 在 Kaggle Output 中下载结果文件。')"""),
 def build_notebook(model_path: str = DEFAULT_MODEL,
                    data_path: str = DEFAULT_DATA,
                    code_path: str = DEFAULT_CODE,
-                   wheels_path: str = DEFAULT_WHEELS) -> dict:
+                   wheels_path: str = DEFAULT_WHEELS,
+                   checkpoint_path: str = DEFAULT_CHECKPOINT) -> dict:
     cells = []
     for fn in [
         cells_header,
-        lambda: cells_mount_config(model_path, data_path, code_path, wheels_path),
+        lambda: cells_mount_config(model_path, data_path, code_path, wheels_path, checkpoint_path),
         cells_install_deps,
         cells_data_model,
         cells_model_init,
+        cells_vram_profile,
+        cells_vram_cleanup,
         cells_train_config,
         cells_train_loop,
         cells_eval,
@@ -670,14 +1147,17 @@ def main():
                         help="代码挂载路径 (默认: %s)" % DEFAULT_CODE)
     parser.add_argument("--wheels", default=DEFAULT_WHEELS,
                         help="依赖挂载路径 (默认: %s)" % DEFAULT_WHEELS)
+    parser.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT,
+                        help="Checkpoint 路径 (默认: 空=从头训练)")
     args = parser.parse_args()
 
     path = save_notebook(args.output,
                          model_path=args.model,
                          data_path=args.data,
                          code_path=args.code,
-                         wheels_path=args.wheels)
-    nb = build_notebook(args.model, args.data, args.code, args.wheels)
+                         wheels_path=args.wheels,
+                         checkpoint_path=args.checkpoint)
+    nb = build_notebook(args.model, args.data, args.code, args.wheels, args.checkpoint)
     print("CCT Kaggle notebook 已生成: %s" % path)
     print("   %d cells, 版本 %s" % (len(nb["cells"]), VERSION))
     print()

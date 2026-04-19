@@ -1,8 +1,8 @@
-"""CCTAttention — 改造自 LlamaAttention, 内置循环嵌入 + precision bias
+"""CCTAttention — 改造自 LlamaAttention, 内置循环嵌入 + entropy temperature
 
 复制 LlamaAttention 源码, 新增:
 1. 旋转循环嵌入 (CycleEmbed): Q/K 投影前施加 → 保留循环信息
-2. Precision bias: attention logits 加入 precision 调制
+2. Entropy temperature: 基于输出 entropy 的 per-query 温度调制
 3. SDPA 加速: 使用 F.scaled_dot_product_attention 替代手动 matmul
 
 每层双重旋转操作:
@@ -27,7 +27,7 @@ from .cycle_embedding import RotaryCycleEmbedding
 
 
 class CCTAttention(nn.Module):
-    """CCT Attention — 在 LlamaAttention 基础上新增循环嵌入和 precision bias"""
+    """CCT Attention — 在 LlamaAttention 基础上新增循环嵌入和 entropy temperature"""
 
     def __init__(
         self,
@@ -78,7 +78,8 @@ class CCTAttention(nn.Module):
         attention_mask: Optional[torch.Tensor] = None,
         past_key_values: Optional[Cache] = None,
         cycle_k: int = 0,
-        precision_bias: Optional[torch.Tensor] = None,
+        precision_bias: Optional[torch.Tensor] = None,  # DEPRECATED
+        entropy_temperature: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         input_shape = hidden_states.shape[:-1]
@@ -109,13 +110,13 @@ class CCTAttention(nn.Module):
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-        # Precision 增益调制: 吸收进 Q (数学等价于 post-QK^T 乘性增益)
-        # (Q * gain) @ K^T * scale = Q @ K^T * scale * gain
-        if precision_bias is not None:
-            gain = (1.0 + precision_bias.unsqueeze(1).unsqueeze(-1)).to(
+        # Entropy temperature: 除法调制 query (等效于 QK^T / temp)
+        # entropy_temperature: [B, T], 范围 [0.5, 1.0]
+        if entropy_temperature is not None:
+            temp = entropy_temperature[:, None, :, None].to(
                 query_states.dtype
             )  # [B, 1, S_q, 1]
-            query_states = query_states * gain
+            query_states = query_states / temp
 
         dropout_p = self.attention_dropout if self.training else 0.0
 

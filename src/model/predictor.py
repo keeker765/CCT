@@ -1,3 +1,4 @@
+# DEPRECATED: replaced by entropy-based mechanism in v2
 """CCT Predictor — 前向预测 (predict column residual Δ)
 
 设计:

@@ -1,3 +1,4 @@
+# DEPRECATED: replaced by entropy-based mechanism in v2
 """L6Precision — 皮层柱 L6 统一模块: 注意力调制 + 停止决策
 
 生物学依据:

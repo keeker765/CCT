@@ -2,6 +2,7 @@
 
 复制 LlamaDecoderLayer 源码, 替换 LlamaAttention → CCTAttention。
 FFN / RMSNorm / 残差连接保持不变。
+支持 entropy_temperature 透传给 CCTAttention。
 """
 
 from typing import Optional, Tuple
@@ -53,7 +54,8 @@ class CCTDecoderLayer(nn.Module):
         past_key_values: Optional[Cache] = None,
         position_embeddings: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         cycle_k: int = 0,
-        precision_bias: Optional[torch.Tensor] = None,
+        precision_bias: Optional[torch.Tensor] = None,  # DEPRECATED
+        entropy_temperature: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
         # Self Attention (pre-norm)
@@ -67,6 +69,7 @@ class CCTDecoderLayer(nn.Module):
             past_key_values=past_key_values,
             cycle_k=cycle_k,
             precision_bias=precision_bias,
+            entropy_temperature=entropy_temperature,
             **kwargs,
         )
         hidden_states = residual + hidden_states

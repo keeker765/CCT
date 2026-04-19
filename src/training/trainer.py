@@ -10,7 +10,7 @@ import logging
 
 from ..model.wrapped_model import CCTLlamaModel
 from ..model.column_config import CCTConfig
-from .scheduler import get_cosine_schedule_with_warmup, compute_halt_tau
+from .scheduler import get_cosine_schedule_with_warmup
 
 logger = logging.getLogger(__name__)
 
@@ -85,15 +85,6 @@ class CCTTrainer:
 
             batch = {k: v.to(device) for k, v in batch.items()}
 
-            # 更新 τ_halt
-            tau_halt = compute_halt_tau(
-                self.global_step,
-                self.config.max_steps,
-                self.config.halt_tau_start,
-                self.config.halt_tau_end,
-            )
-            self.model.set_halt_tau(tau_halt)
-
             # Forward + backward
             with autocast("cuda", enabled=self.use_amp, dtype=self.amp_dtype):
                 outputs = self.model(
@@ -120,19 +111,13 @@ class CCTTrainer:
             if self.global_step % getattr(self.config, "logging_steps", 10) == 0:
                 loss_dict = outputs.get("loss_dict", {})
                 num_iter = outputs.get("num_iterations", 0)
-                eff_iters = outputs.get("effective_iters", 0)
-                eff_std = outputs.get("eff_iters_std", 0)
-                score_std = outputs.get("score_std", 0)
+                mean_ent = outputs.get("mean_entropy", 0)
                 logger.info(
                     f"Step {self.global_step} | "
                     f"loss={loss_dict.get('loss_total', 0):.4f} | "
                     f"lm={loss_dict.get('loss_lm', 0):.4f} "
-                    f"pred={loss_dict.get('loss_pred', 0):.4f} "
-                    f"ent={loss_dict.get('loss_entropy', 0):.4f} "
-                    f"ponder={loss_dict.get('loss_ponder', 0):.4f} | "
-                    f"eff_iters={eff_iters:.2f}±{eff_std:.2f} "
-                    f"score_std={score_std:.4f} "
-                    f"tau={tau_halt:.3f}"
+                    f"mono={loss_dict.get('loss_mono', 0):.4f} | "
+                    f"H={mean_ent:.3f} iters={num_iter}"
                 )
 
             # 保存
