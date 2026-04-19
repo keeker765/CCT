@@ -1,9 +1,10 @@
 """CCT 损失函数 (v2: entropy-driven)
 
-L_total = mean(L_LM_k) + λ_mono · L_mono
+L_total = mean(L_LM_k) + λ_mono · scale · L_mono
 
 - L_LM_k: 每次迭代通过 back+norm+lm_head 的 CrossEntropy
 - L_mono: entropy 方向损失 — 奖励递减，惩罚递增 (无 ReLU，双向)
+- scale = |L_LM|/|L_mono| (自适应, detached) — 使 mono 梯度自动匹配 LM 量级
 """
 
 import torch
@@ -65,14 +66,17 @@ def compute_total_loss(
     lambda_mono: float = 0.1,
     valid_mask: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
-    """计算总损失
+    """计算总损失 (自适应缩放)
 
-    L_total = mean(lm_losses) + λ_mono · L_mono
+    L_total = mean(lm_losses) + λ_mono · (|lm|/|mono|) · L_mono
+
+    scale = |lm_loss.detach()| / |mono.detach()| 使 mono 梯度自动匹配 LM 量级。
+    lambda_mono=0.1 → mono 贡献约 10% of LM loss。
 
     Args:
         lm_losses: 每次迭代的 LM loss (标量 list)
         entropies: 每次迭代的 per-token entropy [B, T] list
-        lambda_mono: L_mono 权重
+        lambda_mono: L_mono 相对权重 (0.1 = 10% of LM)
         valid_mask: [B, T] — padding mask
 
     Returns:
@@ -85,7 +89,11 @@ def compute_total_loss(
     # L_mono
     l_mono = compute_monotonic_entropy_loss(entropies, valid_mask)
 
-    total = lm_loss + lambda_mono * l_mono
+    # 自适应缩放: mono 梯度 ≈ lambda_mono × LM 梯度
+    mono_abs = l_mono.detach().abs().clamp(min=1e-6)
+    scale = lm_loss.detach().abs() / mono_abs
+
+    total = lm_loss + lambda_mono * scale * l_mono
 
     loss_dict = {
         "loss_total": total.item(),
