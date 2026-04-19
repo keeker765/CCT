@@ -380,6 +380,8 @@ class CCTLlamaModel(nn.Module):
 
                 # L6 停止决策 (用 score[k], 当前迭代)
                 p_halt = self.l6_precision.compute_halt(score, inf_tau)
+                p_halts.append(p_halt)
+                remainders_list.append(remainder.clone())
 
                 # Per-token ACT 累积
                 weight = (remainder * p_halt).unsqueeze(-1)
