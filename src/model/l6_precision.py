@@ -10,7 +10,8 @@
 
 两个输出, 同一个信号 (prediction score):
   attention_bias = λ · (1 - σ(score / τ_p))    — 注意力增益
-  p_halt = σ((gain · score + bias) / τ_halt)    — 停止概率
+  p_halt = σ((gain · norm(score) + bias) / τ_halt) — 停止概率
+  其中 norm(score) 为 per-sequence z-score 归一化, 放大 token 间差异
 """
 
 import torch
@@ -28,9 +29,10 @@ class L6Precision(nn.Module):
       低 score (surprise) → precision 高 → 多关注
 
     停止决策 (L6→L5, Free Energy 收敛):
-      p_halt = σ((softplus(gain) · score + bias) / τ_halt)
-      高 score → 收敛 → halt
-      低 score → 继续处理
+      score_norm = (score - μ) / σ   (per-sequence 归一化)
+      p_halt = σ((softplus(gain) · score_norm + bias) / τ_halt)
+      高 relative score → 收敛 → halt
+      低 relative score → 继续处理
     """
 
     def __init__(
@@ -44,7 +46,7 @@ class L6Precision(nn.Module):
 
         # Halt 参数: score → 停止决策
         self._halt_gain = nn.Parameter(torch.tensor(1.0))   # softplus 保证 > 0
-        self.halt_bias = nn.Parameter(torch.tensor(-2.0))    # 初始偏低, 鼓励多迭代
+        self.halt_bias = nn.Parameter(torch.tensor(-0.5))    # 归一化后 σ(-0.5)≈0.38, eff≈2.6
 
     def compute_attention_bias(self, score: torch.Tensor) -> torch.Tensor:
         """Score → attention 增益调制 (用于 column layers)
@@ -62,7 +64,12 @@ class L6Precision(nn.Module):
     ) -> torch.Tensor:
         """Score → 停止概率 (用于 ACT)
 
-        p_halt = σ((softplus(gain) · score + bias) / τ_halt)
+        先 per-sequence z-score 归一化, 再仿射变换:
+          score_norm = (score - μ_seq) / σ_seq
+          p_halt = σ((softplus(gain) · score_norm + bias) / τ_halt)
+
+        归一化使 gain 在 std=1 尺度上操作,
+        token 间差异不再被 score 绝对幅度压缩.
 
         Args:
             score: [batch, seq_len] — prediction score (detached)
@@ -71,5 +78,9 @@ class L6Precision(nn.Module):
             p_halt: [batch, seq_len]
         """
         gain = F.softplus(self._halt_gain)
-        halt_logit = gain * score + self.halt_bias
+        # Per-sequence 归一化: 放大 token 间相对差异
+        mu = score.mean(dim=-1, keepdim=True)
+        sigma = score.std(dim=-1, keepdim=True).clamp(min=1e-6)
+        score_norm = (score - mu) / sigma
+        halt_logit = gain * score_norm + self.halt_bias
         return torch.sigmoid(halt_logit / tau_halt)
