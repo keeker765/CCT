@@ -34,7 +34,7 @@ from .cycle_embedding import RotaryCycleEmbedding
 from .predictor import CCTPredictor
 from .l6_precision import L6Precision
 from .losses import compute_lm_loss, compute_total_loss
-from .net2wider import widen_mlp
+from .net2wider import widen_mlp, widen_mlp_cross_layer, auto_donor_mapping
 
 
 class CCTLlamaModel(nn.Module):
@@ -93,13 +93,33 @@ class CCTLlamaModel(nn.Module):
             cct_layer.post_attention_layernorm.load_state_dict(
                 src_layer.post_attention_layernorm.state_dict()
             )
-
-            # Net2WiderNet: 加宽 Column MLP
-            if config.column_d_ff > config.d_ff:
-                widen_mlp(cct_layer.mlp, config.column_d_ff,
-                          noise_std=config.widen_noise_std)
-
             self.column_layers.append(cct_layer)
+
+        # === MLP 加宽 (在 column 层构建完成后) ===
+        if config.column_d_ff > config.d_ff:
+            if config.widen_mode == "cross":
+                donor_map = auto_donor_mapping(
+                    config.pretrained_column_layers,
+                    config.num_base_layers,
+                    config.pretrained_front_layers,
+                    config.pretrained_back_layers,
+                )
+                for i, src_idx in enumerate(config.pretrained_column_layers):
+                    if src_idx in donor_map:
+                        donor_layer = base_model.model.layers[donor_map[src_idx]]
+                        widen_mlp_cross_layer(
+                            self.column_layers[i].mlp,
+                            donor_layer.mlp,
+                            donor_init_scale=config.donor_init_scale,
+                        )
+                        print(f"  Column[{src_idx}] ← Donor[{donor_map[src_idx]}] "
+                              f"(cross-layer, scale={config.donor_init_scale})")
+            else:
+                for i, cct_layer in enumerate(self.column_layers):
+                    widen_mlp(cct_layer.mlp, config.column_d_ff,
+                              noise_std=config.widen_noise_std)
+                    print(f"  Column[{config.pretrained_column_layers[i]}] "
+                          f"widened to d_ff={config.column_d_ff} (self)")
 
         # === 构建 Fixed Back 层 (标准 LlamaDecoderLayer) ===
         self.back_layers = nn.ModuleList()

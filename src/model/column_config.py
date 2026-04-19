@@ -34,6 +34,8 @@ class CCTConfig:
     # Column MLP 加宽 (Net2WiderNet)
     column_d_ff: int = 8192  # 默认=原始, 设 12288(1.5x) 或 16384(2x) 激活加宽
     widen_noise_std: float = 0.01  # 复制神经元的噪声强度
+    widen_mode: str = "cross"  # "self"=Net2WiderNet复制自身, "cross"=融合donor层FFN
+    donor_init_scale: float = 0.1  # cross模式: donor层down_proj初始缩放
 
     # L6 Precision
     lambda_precision_init: float = 1.0
