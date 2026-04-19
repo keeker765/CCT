@@ -510,7 +510,7 @@ all_eff_iters_viz = []  # per-token effective iterations
 with torch.no_grad():
     for bi, batch in enumerate(eval_loader):
         if bi >= 20: break
-        batch = {{k: v.to(device) for k, v in batch.items()}}
+        batch = {k: v.to(device) for k, v in batch.items()}
         with torch.amp.autocast('cuda', dtype=DTYPE):
             out = model(input_ids=batch['input_ids'],
                        attention_mask=batch['attention_mask'],
