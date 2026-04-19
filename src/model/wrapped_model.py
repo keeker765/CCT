@@ -35,6 +35,15 @@ from .predictor import CCTPredictor
 from .l6_precision import L6Precision
 from .losses import compute_lm_loss, compute_total_loss
 from .net2wider import widen_mlp, widen_mlp_cross_layer, auto_donor_mapping
+from .fusegpt_graft import (
+    FusionLinear,
+    build_multi_absorb_map,
+    attach_fusion_grafts,
+    fold_all_fusions,
+    get_fusion_params,
+    get_fusion_param_count,
+    get_fusion_buffer_count,
+)
 
 
 class CCTLlamaModel(nn.Module):
@@ -120,6 +129,33 @@ class CCTLlamaModel(nn.Module):
                               noise_std=config.widen_noise_std)
                     print(f"  Column[{config.pretrained_column_layers[i]}] "
                           f"widened to d_ff={config.column_d_ff} (self)")
+
+        # === FuseGPT-style 在线融合 (吸收被删层知识) ===
+        if config.use_fusion_graft:
+            absorb_map = build_multi_absorb_map(
+                config.pretrained_column_layers,
+                config.num_base_layers,
+                config.pretrained_front_layers,
+                config.pretrained_back_layers,
+            )
+            for i, src_idx in enumerate(config.pretrained_column_layers):
+                if src_idx in absorb_map:
+                    donor_layers = [
+                        base_model.model.layers[j]
+                        for j in absorb_map[src_idx]
+                    ]
+                    attach_fusion_grafts(
+                        self.column_layers[i],
+                        donor_layers,
+                        rank=config.fusion_rank,
+                        pool_donors=config.fusion_pool_donors,
+                        freeze_base=config.fusion_freeze_base,
+                    )
+                    print(
+                        f"  Column[{src_idx}] ← Fusion{absorb_map[src_idx]} "
+                        f"(rank={config.fusion_rank}, "
+                        f"pool={config.fusion_pool_donors})"
+                    )
 
         # === 构建 Fixed Back 层 (标准 LlamaDecoderLayer) ===
         self.back_layers = nn.ModuleList()
@@ -359,8 +395,10 @@ class CCTLlamaModel(nn.Module):
                 pred_losses.append(l_pred_k)
 
                 # j. 提前退出优化 (remainder 极小时无意义继续)
-                if remainder.max().item() < 1e-4:
-                    break
+                # 注: 训练时 soft ACT 几乎不触发, 但避免 .item() 以兼容 torch.compile
+                if not torch.compiler.is_compiling():
+                    if remainder.max().item() < 1e-4:
+                        break
 
             # 分配剩余 remainder 给最后一轮
             output = output + remainder.unsqueeze(-1) * h
@@ -494,11 +532,25 @@ class CCTLlamaModel(nn.Module):
         """更新 L6 停止退火温度"""
         self.halt_tau.fill_(tau)
 
+    def fold_fusions(self):
+        """折叠所有 FusionLinear → 普通 Linear (零推理开销)
+
+        调用后 use_fusion_graft 的效果永久生效于权重中,
+        模型行为不变, 但不再有额外参数/buffer.
+        部署前或保存最终 checkpoint 前调用.
+        """
+        fold_all_fusions(self)
+
     def enable_gradient_checkpointing(self):
         self._gradient_checkpointing = True
 
     def get_param_groups(self) -> List[dict]:
-        """返回分层学习率参数组"""
+        """返回分层学习率参数组
+
+        Group 0: 基座参数 (learning_rate)
+        Group 1: CCT 新模块 (new_module_lr)
+        Group 2: 融合参数 A/B (fusion_lr) — 仅 use_fusion_graft=True 时存在
+        """
         new_modules = [
             self.cct_predictor, self.l6_precision,
             self.inter_iter_norm,
@@ -507,19 +559,38 @@ class CCTLlamaModel(nn.Module):
         for m in new_modules:
             new_params.update(id(p) for p in m.parameters())
 
+        # Fusion params (from FusionLinear.A, FusionLinear.B)
+        fusion_param_ids = set()
+        fusion_params_list = []
+        if self.config.use_fusion_graft:
+            fp = get_fusion_params(self)
+            fusion_param_ids = set(id(p) for p in fp)
+            fusion_params_list = [p for p in fp if p.requires_grad]
+
+        # Disjointness check
+        assert not (new_params & fusion_param_ids), \
+            "融合参数与新模块参数重叠!"
+
         base_params = [
             p for p in self.parameters()
-            if p.requires_grad and id(p) not in new_params
+            if p.requires_grad
+            and id(p) not in new_params
+            and id(p) not in fusion_param_ids
         ]
         new_params_list = [
             p for p in self.parameters()
             if p.requires_grad and id(p) in new_params
         ]
 
-        return [
+        groups = [
             {"params": base_params, "lr": self.config.learning_rate},
             {"params": new_params_list, "lr": self.config.new_module_lr},
         ]
+        if fusion_params_list:
+            groups.append(
+                {"params": fusion_params_list, "lr": self.config.fusion_lr}
+            )
+        return groups
 
     def get_trainable_params_info(self) -> str:
         total = sum(p.numel() for p in self.parameters())
@@ -542,4 +613,13 @@ class CCTLlamaModel(nn.Module):
         )
         if self.config.use_ffn_expansion and self.config.column_d_ff > self.config.d_ff:
             info += f" (widened d_ff={self.config.column_d_ff})"
+        if self.config.use_fusion_graft:
+            fp_count = get_fusion_param_count(self)
+            fb_count = get_fusion_buffer_count(self)
+            info += (
+                f"\nFusion params (A,B): {fp_count:,} "
+                f"(rank={self.config.fusion_rank})\n"
+                f"Fusion buffers (W_pruned): {fb_count:,} "
+                f"(non-persistent, 不计入 state_dict)"
+            )
         return info
