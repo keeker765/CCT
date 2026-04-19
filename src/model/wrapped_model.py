@@ -34,6 +34,7 @@ from .cycle_embedding import RotaryCycleEmbedding
 from .predictor import CCTPredictor
 from .l6_precision import L6Precision
 from .losses import compute_lm_loss, compute_total_loss
+from .net2wider import widen_mlp
 
 
 class CCTLlamaModel(nn.Module):
@@ -92,6 +93,12 @@ class CCTLlamaModel(nn.Module):
             cct_layer.post_attention_layernorm.load_state_dict(
                 src_layer.post_attention_layernorm.state_dict()
             )
+
+            # Net2WiderNet: 加宽 Column MLP
+            if config.column_d_ff > config.d_ff:
+                widen_mlp(cct_layer.mlp, config.column_d_ff,
+                          noise_std=config.widen_noise_std)
+
             self.column_layers.append(cct_layer)
 
         # === 构建 Fixed Back 层 (标准 LlamaDecoderLayer) ===
@@ -500,8 +507,15 @@ class CCTLlamaModel(nn.Module):
         cct_params = sum(
             p.numel() for m in cct_modules for p in m.parameters()
         )
-        return (
+        col_mlp_params = sum(
+            p.numel() for layer in self.column_layers for p in layer.mlp.parameters()
+        )
+        info = (
             f"Total params: {total:,}\n"
             f"Trainable params: {trainable:,} ({100*trainable/total:.2f}%)\n"
-            f"CCT new params: {cct_params:,} ({100*cct_params/total:.2f}%)"
+            f"CCT new params: {cct_params:,} ({100*cct_params/total:.2f}%)\n"
+            f"Column MLP params: {col_mlp_params:,}"
         )
+        if self.config.column_d_ff > self.config.d_ff:
+            info += f" (widened d_ff={self.config.column_d_ff})"
+        return info

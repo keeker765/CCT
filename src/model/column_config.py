@@ -31,6 +31,10 @@ class CCTConfig:
     max_iter: int = 10
     phi: float = 1.618  # 黄金比例
 
+    # Column MLP 加宽 (Net2WiderNet)
+    column_d_ff: int = 8192  # 默认=原始, 设 12288(1.5x) 或 16384(2x) 激活加宽
+    widen_noise_std: float = 0.01  # 复制神经元的噪声强度
+
     # L6 Precision
     lambda_precision_init: float = 1.0
     precision_temperature: float = 0.5  # 固定超参数

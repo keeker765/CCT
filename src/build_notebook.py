@@ -246,6 +246,7 @@ cct_config = CCTConfig(
     lambda_entropy=0.0,  # 已关闭: τ退火已足够
     lambda_ponder=0.0,
     use_ponder_cost=False,
+    column_d_ff=12288,  # Net2WiderNet 1.5x FFN 加宽 (原8192)
     bf16=True,
     gradient_checkpointing=True,
 )
