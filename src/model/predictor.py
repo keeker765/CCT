@@ -27,10 +27,14 @@ class CCTPredictor(nn.Module):
     target_proj: Linear(d_model → info_dim) — 冻结随机投影
     """
 
-    def __init__(self, d_model: int, info_dim: int = 256):
+    def __init__(self, d_model: int, info_dim: int = 256, dropout: float = 0.3):
         super().__init__()
         self.info_dim = info_dim
-        self.predictor = nn.Linear(d_model, info_dim)
+        # 单层 + dropout (模拟神经噪声, 防止预测过度精确)
+        self.predictor = nn.Sequential(
+            nn.Linear(d_model, info_dim),
+            nn.Dropout(dropout),
+        )
         # 冻结随机投影: delta → info_dim (不可训练)
         self.target_proj = nn.Linear(d_model, info_dim, bias=False)
         self.target_proj.weight.requires_grad_(False)
