@@ -96,7 +96,7 @@ class CCTLlamaModel(nn.Module):
             self.column_layers.append(cct_layer)
 
         # === MLP 加宽 (在 column 层构建完成后) ===
-        if config.column_d_ff > config.d_ff:
+        if config.use_ffn_expansion and config.column_d_ff > config.d_ff:
             if config.widen_mode == "cross":
                 donor_map = auto_donor_mapping(
                     config.pretrained_column_layers,
@@ -536,6 +536,6 @@ class CCTLlamaModel(nn.Module):
             f"CCT new params: {cct_params:,} ({100*cct_params/total:.2f}%)\n"
             f"Column MLP params: {col_mlp_params:,}"
         )
-        if self.config.column_d_ff > self.config.d_ff:
+        if self.config.use_ffn_expansion and self.config.column_d_ff > self.config.d_ff:
             info += f" (widened d_ff={self.config.column_d_ff})"
         return info

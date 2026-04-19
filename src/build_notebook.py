@@ -14,7 +14,7 @@ from typing import List
 GH_REPO = "keeker765/CCT"
 MODEL_NAME = "unsloth/Llama-3.2-1B"
 DEFAULT_OUTPUT = "notebooks/cct_colab.ipynb"
-VERSION = "v1.0"
+VERSION = "v2.0"
 
 
 # ── Cell 构造器 ───────────────────────────────────────
@@ -51,17 +51,17 @@ def _lines(text: str) -> List[str]:
 def cells_header() -> List[dict]:
     return [
         md(f"""\
-# CCT {VERSION} (Cortical Column Transformer) — Colab 训练
+# CCT {VERSION} — Cortical Column Transformer — Continued Pretraining
 
-**架构**: Fixed Front (L0-L1) → Column (L2-L4, 循环复用 K 次) → Fixed Back (L14-L15)
-- **Predictor + AnchorMLP**: 预测编码误差信号
-- **L6 Precision**: 注意力增益调制 + ACT 停止决策 (统一误差信号驱动)
+**架构**: Fixed Front (L0-L1) → Column (L2,L7,L12 × K 循环) → Fixed Back (L14-L15)
+- **Cross-Layer Fusion**: Column MLP 2x 加宽 (d_ff=16384), 融合 Donor 层 FFN
+- **Predictor + L6 Precision**: 预测编码误差 → 注意力调制 + ACT 停止
 - **RotaryCycleEmbed**: φ 黄金比例旋转循环嵌入
 
-**损失**: L_LM + λ_pred · L_pred + λ_entropy · H(halt)
-**数据**: OpenHermes 2.5 (复杂 SFT, 推理/代码/数学混合)
+**数据**: 50% FinePDFs + 30% DCLM + 20% FineWeb-Edu (1B tokens, Packing)
+**训练**: Continued Pretraining (CLM loss on all tokens), seq=2048, effective batch=128
 
-**流程**: 安装 → 下载代码 → 数据+模型 → 训练 → 评估 → 可视化 → 备份"""),
+**流程**: 安装 → 下载 → 数据+模型 → 训练 → 评估 → 可视化 → 备份"""),
     ]
 
 
@@ -107,224 +107,226 @@ for f in key_files:
     ]
 
 
-# Llama 3 chat template — base 模型没有内置 chat_template，必须手动设置
-_CHAT_TEMPLATE = (
-    '{% for message in messages %}'
-    '{% if message["role"] == "user" %}'
-    '<|start_header_id|>user<|end_header_id|>\\n\\n'
-    '{{ message["content"] }}<|eot_id|>'
-    '{% elif message["role"] == "assistant" %}'
-    '<|start_header_id|>assistant<|end_header_id|>\\n\\n'
-    '{{ message["content"] }}<|eot_id|>'
-    '{% endif %}'
-    '{% endfor %}'
-)
-
-
 def cells_data_model() -> List[dict]:
     return [
         md("## 2. 数据加载 + 模型初始化"),
-        code(f"""\
-# === 2. 数据 + 模型 ===
+        code("""\
+# === 2a. Imports + 超参数 ===
 import sys, math, time, gc
 import torch
 import torch.nn as nn
-from datasets import load_dataset
-from torch.utils.data import DataLoader, Dataset, random_split
+from datasets import load_dataset, interleave_datasets
+from torch.utils.data import DataLoader, Dataset, IterableDataset
 from transformers import AutoTokenizer, LlamaForCausalLM
 
 sys.path.insert(0, '.')
 from src.model.wrapped_model import CCTLlamaModel
 from src.model.column_config import CCTConfig
-from src.training.scheduler import compute_halt_tau
+from src.training.scheduler import compute_halt_tau, get_cosine_schedule_with_warmup
 
-# === 超参数 (与 PPG 对齐) ===
-CFG = {{
-    'num_epochs': 1,
-    'batch_size': 32,
-    'grad_accum': 1,
-    'max_seq_len': 512,
-    'lr': 2e-5,
-    'new_lr': 1e-4,
+CFG = {
+    'max_steps': 3800,           # 1B tokens / 262K tokens_per_step
+    'batch_size': 32,            # micro batch (96GB VRAM)
+    'grad_accum': 4,             # effective batch = 128 seqs = 262K tokens/step
+    'max_seq_len': 2048,         # match MoR
+    'lr': 1e-4,                  # pretrained backbone (CPT)
+    'new_lr': 5e-4,              # CCT new modules (predictor, L6, cycle_emb)
     'max_grad_norm': 1.0,
-    'log_interval': 20,
-    'eval_interval': 100,
-    'max_samples': 40000,
-}}
+    'weight_decay': 0.01,
+    'warmup_steps': 200,         # ~5% of total steps
+    'log_interval': 20,          # log every N optimizer steps
+    'eval_interval': 200,        # eval every N optimizer steps
+    'eval_chunks': 100,          # eval set: 100 chunks x 2048 = 205K tokens
+}
 
-# === Tokenizer ===
+# Tokenizer
 tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
 if tokenizer.pad_token is None:
     tokenizer.pad_token = tokenizer.eos_token
-# 强制右侧 padding: 左侧 padding 会导致 labels[:prompt_len] mask 错位
-tokenizer.padding_side = 'right'
-print('padding_side:', tokenizer.padding_side)
+print('Vocab size: %d, EOS id: %d' % (tokenizer.vocab_size, tokenizer.eos_token_id))"""),
+        code("""\
+# === 2b. 流式数据集: 50% FinePDFs + 30% DCLM + 20% FineWeb-Edu ===
+# codelion's 1B Token Challenge (2025): 各源预采样 1B tokens
 
-# unsloth/Llama-3.2-1B 是 base 模型, 没有 chat_template, 手动设置
-LLAMA3_CHAT_TEMPLATE = '{_CHAT_TEMPLATE}'
-if tokenizer.chat_template is None:
-    tokenizer.chat_template = LLAMA3_CHAT_TEMPLATE
-    print('已手动设置 Llama 3 chat template')
-else:
-    print('Tokenizer 已有 chat_template')
+DS_NAMES = [
+    'codelion/finepdfs-1B',      # PDF 学术文本 (最高质量单源)
+    'codelion/dclm-baseline-1B', # DataComp-LM 筛选 web 文本
+    'codelion/fineweb-edu-1B',   # 教育类 web 页面 (MoR 同源)
+]
+# 文档级采样概率. 由于 FinePDFs 文档较长 (~3K tok/doc vs ~1.3K),
+# 实际 token 比例会偏向 FinePDFs (~70/18/12).
+# 如需精确 token 级 50/30/20, 可调整为 [0.29, 0.40, 0.31]
+DS_PROBS = [0.5, 0.3, 0.2]
 
-# === 数据集 (OpenHermes 2.5 — ShareGPT 格式) ===
-# 更复杂的 SFT 数据, 推理/代码/数学/对话混合
+print('Loading 3 datasets (streaming)...')
+ds_list_train = [load_dataset(n, split='train', streaming=True) for n in DS_NAMES]
+mixed_train = interleave_datasets(ds_list_train, probabilities=DS_PROBS,
+                                   seed=42, stopping_strategy='all_exhausted')
 
-class SFTDataset(Dataset):
-    def __init__(self, dataset, tokenizer, max_length=512, max_samples=None):
+# Eval: 独立流 (不同 seed -> 不同文档顺序)
+ds_list_eval = [load_dataset(n, split='train', streaming=True) for n in DS_NAMES]
+mixed_eval = interleave_datasets(ds_list_eval, probabilities=DS_PROBS,
+                                  seed=123, stopping_strategy='all_exhausted')
+
+print('Interleaved: 50% FinePDFs + 30% DCLM + 20% FineWeb-Edu')"""),
+        code("""\
+# === 2c. Packing: 文档拼接 + EOS -> 固定 seq_len 切块 ===
+class PackedDataset(IterableDataset):
+    \"\"\"Packing: concatenate docs with EOS separator, chunk into seq_len.
+    零 padding 浪费, 工业标准预训练数据策略.\"\"\"
+    def __init__(self, hf_dataset, tokenizer, seq_len=2048):
+        self.dataset = hf_dataset
         self.tokenizer = tokenizer
-        self.max_length = max_length
-        self.data = []
-        for i, ex in enumerate(dataset):
-            if max_samples and i >= max_samples: break
-            convs = ex.get('conversations', [])
-            if not convs: continue
-            # 提取 human 和 gpt 回合
-            user_parts, gpt_parts = [], []
-            for turn in convs:
-                role = turn.get('from', '')
-                val = turn.get('value', '').strip()
-                if not val: continue
-                if role == 'human':
-                    user_parts.append(val)
-                elif role == 'gpt':
-                    gpt_parts.append(val)
-            if not user_parts or not gpt_parts: continue
-            user_msg = '\\n\\n'.join(user_parts)
-            gpt_msg = '\\n\\n'.join(gpt_parts)
-            prompt_msgs = [{{'role': 'user', 'content': user_msg}}]
-            full_msgs = prompt_msgs + [{{'role': 'assistant', 'content': gpt_msg}}]
-            prompt_text = tokenizer.apply_chat_template(
-                prompt_msgs, tokenize=False, add_generation_prompt=True)
-            full_text = tokenizer.apply_chat_template(
-                full_msgs, tokenize=False, add_generation_prompt=False)
-            prompt_len = len(tokenizer(prompt_text, add_special_tokens=False)['input_ids'])
-            self.data.append((full_text, prompt_len))
+        self.seq_len = seq_len
+
+    def __iter__(self):
+        buffer = []
+        for example in self.dataset:
+            text = example.get('text', '')
+            if not text or not text.strip():
+                continue
+            ids = self.tokenizer(text, add_special_tokens=False)['input_ids']
+            buffer.extend(ids)
+            buffer.append(self.tokenizer.eos_token_id)
+            while len(buffer) >= self.seq_len:
+                chunk = buffer[:self.seq_len]
+                buffer = buffer[self.seq_len:]
+                t = torch.tensor(chunk, dtype=torch.long)
+                yield {
+                    'input_ids': t,
+                    'attention_mask': torch.ones_like(t),
+                    'labels': t.clone(),
+                }
+
+class ListDataset(Dataset):
+    \"\"\"Wrap a list as a map-style Dataset for DataLoader.\"\"\"
+    def __init__(self, data): self.data = data
     def __len__(self): return len(self.data)
-    def __getitem__(self, idx):
-        text, prompt_len = self.data[idx]
-        enc = self.tokenizer(text, truncation=True,
-                             max_length=self.max_length,
-                             padding='max_length', return_tensors='pt')
-        input_ids = enc['input_ids'].squeeze(0)
-        attn = enc['attention_mask'].squeeze(0)
-        labels = input_ids.clone()
-        labels[attn == 0] = -100
-        # mask instruction 部分: 只计算 assistant response 的 loss
-        if prompt_len > 0:
-            labels[:prompt_len] = -100
-        return {{'input_ids': input_ids, 'attention_mask': attn, 'labels': labels}}
+    def __getitem__(self, idx): return self.data[idx]
 
-# 预览
-raw = load_dataset('teknium/OpenHermes-2.5', split='train')
-print('OpenHermes 2.5 总量: %d' % len(raw))
-_pv = SFTDataset([raw[0]], tokenizer, max_length=128, max_samples=1)
-print('=== Chat Template 预览 ===')
-print(tokenizer.decode(_pv[0]['input_ids'][:80]))
-print('...\\n')
+# Eval set: 收集固定数量的 packed chunks 到内存
+print('Building eval set (%d chunks)...' % CFG['eval_chunks'])
+eval_packed = PackedDataset(mixed_eval, tokenizer, seq_len=CFG['max_seq_len'])
+eval_data = []
+for item in eval_packed:
+    eval_data.append(item)
+    if len(eval_data) >= CFG['eval_chunks']:
+        break
+eval_loader = DataLoader(ListDataset(eval_data), batch_size=CFG['batch_size'], num_workers=0)
+print('Eval: %d chunks (%d tokens)' % (len(eval_data), len(eval_data) * CFG['max_seq_len']))
 
-# labels 健全性检查
-_s = _pv[0]
-_valid_labels = (_s['labels'] != -100).sum().item()
-_total_attn = _s['attention_mask'].sum().item()
-print('Labels check: valid=%d, attn_ones=%d (valid < attn_ones = prompt correctly masked)' % (
-    _valid_labels, _total_attn))
-assert _valid_labels < _total_attn, 'BUG: prompt tokens not masked in labels!'
-
-full_ds = SFTDataset(raw, tokenizer, max_length=512, max_samples=CFG['max_samples'])
-eval_sz = int(len(full_ds) * 0.05)
-train_ds, eval_ds = random_split(full_ds, [len(full_ds) - eval_sz, eval_sz])
-print('Train: %d, Eval: %d' % (len(train_ds), len(eval_ds)))
-
-# === 模型 ===
+# Train DataLoader (streaming Packing)
+train_packed = PackedDataset(mixed_train, tokenizer, seq_len=CFG['max_seq_len'])
+train_loader = DataLoader(train_packed, batch_size=CFG['batch_size'],
+                          num_workers=0, pin_memory=True)
+print('Train loader ready (streaming Packing, seq_len=%d)' % CFG['max_seq_len'])"""),
+        code("""\
+# === 2d. 模型初始化 ===
 DTYPE = torch.bfloat16
 
 cct_config = CCTConfig(
     max_iter=5,
     lambda_pred=0.1,
-    lambda_entropy=0.0,  # 已关闭: τ退火已足够
+    lambda_entropy=0.0,
     lambda_ponder=0.0,
     use_ponder_cost=False,
-    column_d_ff=16384,  # Cross-Layer Fusion 2x FFN 加宽 (原8192)
-    widen_mode='cross',  # 融合 donor 层的 FFN 知识
+    column_d_ff=16384,       # 2x FFN 加宽 (Cross-Layer Fusion)
+    widen_mode='cross',
     donor_init_scale=0.1,
     bf16=True,
     gradient_checkpointing=True,
+    max_seq_len=2048,
+    per_device_batch_size=32,
+    gradient_accumulation_steps=4,
+    learning_rate=1e-4,
+    new_module_lr=5e-4,
+    max_steps=3800,
+    warmup_steps=200,
 )
 
 base = LlamaForCausalLM.from_pretrained(
     MODEL_NAME, torch_dtype=DTYPE, trust_remote_code=True)
 model = CCTLlamaModel(base, cct_config)
-
-# 释放 base 模型, 节省 ~2GB GPU 内存
 del base; gc.collect(); torch.cuda.empty_cache()
 
 model.enable_gradient_checkpointing()
 device = torch.device('cuda')
 model = model.to(device)
 print(model.get_trainable_params_info())
-print('Column layers: %d, Max iter: %d' % (
-    len(cct_config.pretrained_column_layers), cct_config.max_iter))"""),
+print('Column layers: %d, Max iter: %d, seq_len: %d' % (
+    len(cct_config.pretrained_column_layers), cct_config.max_iter, CFG['max_seq_len']))"""),
     ]
 
 
 def cells_train_config() -> List[dict]:
     return [
-        md("## 3. 训练 (单阶段, 全参数)"),
+        md("## 3. 训练 (Continued Pretraining)"),
         code("""\
 # === 3. 训练配置 ===
 from torch.optim import AdamW
-from torch.optim.lr_scheduler import CosineAnnealingLR
 
-# 分层 LR
+# 分层 LR: pretrained backbone vs CCT new modules
 param_groups = model.get_param_groups()
-param_groups[0]['lr'] = CFG['lr']
-param_groups[1]['lr'] = CFG['new_lr']
-optimizer = AdamW(param_groups, weight_decay=0.01)
+param_groups[0]['lr'] = CFG['lr']      # backbone: 1e-4
+param_groups[1]['lr'] = CFG['new_lr']  # new modules: 5e-4
+optimizer = AdamW(param_groups, weight_decay=CFG['weight_decay'])
 
-train_loader = DataLoader(train_ds, batch_size=CFG['batch_size'],
-                          shuffle=True, num_workers=0, pin_memory=True)
-eval_loader = DataLoader(eval_ds, batch_size=CFG['batch_size'], num_workers=0)
-total_steps = len(train_loader) * CFG['num_epochs'] // CFG['grad_accum']
-lr_sched = CosineAnnealingLR(optimizer, T_max=total_steps)
+# Cosine schedule with linear warmup
+lr_sched = get_cosine_schedule_with_warmup(
+    optimizer,
+    num_warmup_steps=CFG['warmup_steps'],
+    num_training_steps=CFG['max_steps'],
+    min_lr_ratio=0.1,
+)
 
 os.makedirs('output/cct', exist_ok=True)
-gs, best_eval = 0, float('inf')
+best_eval = float('inf')
 
-print('Total steps: %d (batch=%d x accum=%d, effective=%d)' % (
-    total_steps, CFG['batch_size'], CFG['grad_accum'],
-    CFG['batch_size'] * CFG['grad_accum']))"""),
+eff_batch = CFG['batch_size'] * CFG['grad_accum']
+tokens_per_step = eff_batch * CFG['max_seq_len']
+print('Effective batch: %d seqs = %dK tokens/step' % (eff_batch, tokens_per_step // 1000))
+print('Total: %d steps = %.2fB tokens' % (CFG['max_steps'], CFG['max_steps'] * tokens_per_step / 1e9))"""),
     ]
 
 
 def cells_train_loop() -> List[dict]:
     return [
         code("""\
-# === 训练循环 ===
+# === 训练循环 (step-based, streaming) ===
 import time as _time
 model.train()
 _t0 = _time.time()
-max_steps = CFG.get('max_steps', total_steps)
-print('Training for %d steps (max_steps=%d, total_steps=%d)' % (
-    min(max_steps, total_steps), max_steps, total_steps))
+max_steps = CFG['max_steps']
+print('Training for %d optimizer steps (grad_accum=%d)...' % (max_steps, CFG['grad_accum']))
 
-_stop = False
-for epoch in range(CFG['num_epochs']):
-    if _stop: break
-    avg = {'total': 0, 'lm': 0, 'pred': 0, 'entropy': 0, 'ponder': 0, 'eff_iters': 0, 'eff_std': 0, 'score_std': 0}
-    avg_n = 0
+avg = {'total': 0, 'lm': 0, 'pred': 0, 'eff_iters': 0, 'eff_std': 0, 'score_std': 0}
+avg_n = 0
+train_iter = iter(train_loader)
 
-    for bi, batch in enumerate(train_loader):
-        if gs >= max_steps:
-            _stop = True; break
+for gs in range(max_steps):
+    # tau_halt sigmoid 退火
+    tau_halt = compute_halt_tau(gs, max_steps,
+                                cct_config.halt_tau_start, cct_config.halt_tau_end)
+    model.set_halt_tau(tau_halt)
+
+    # Gradient accumulation: grad_accum 个 micro-batch
+    for _micro in range(CFG['grad_accum']):
+        try:
+            batch = next(train_iter)
+        except StopIteration:
+            print('[Step %d] Stream exhausted, restarting...' % gs)
+            train_packed_new = PackedDataset(
+                interleave_datasets(
+                    [load_dataset(n, split='train', streaming=True) for n in DS_NAMES],
+                    probabilities=DS_PROBS, seed=42 + gs,
+                    stopping_strategy='all_exhausted'),
+                tokenizer, seq_len=CFG['max_seq_len'])
+            train_loader_new = DataLoader(train_packed_new, batch_size=CFG['batch_size'],
+                                          num_workers=0, pin_memory=True)
+            train_iter = iter(train_loader_new)
+            batch = next(train_iter)
+
         batch = {k: v.to(device) for k, v in batch.items()}
-
-        # tau_halt sigmoid 退火 (S 曲线: 末期慢降避免 loss 震荡)
-        tau_halt = compute_halt_tau(gs, max_steps,
-                                   cct_config.halt_tau_start, cct_config.halt_tau_end)
-        model.set_halt_tau(tau_halt)
-
         with torch.amp.autocast('cuda', dtype=DTYPE):
             out = model(input_ids=batch['input_ids'],
                        attention_mask=batch['attention_mask'],
@@ -332,59 +334,57 @@ for epoch in range(CFG['num_epochs']):
         loss = out['loss'] / CFG['grad_accum']
         loss.backward()
 
-        if (bi + 1) % CFG['grad_accum'] == 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), CFG['max_grad_norm'])
-            optimizer.step(); optimizer.zero_grad(); lr_sched.step()
-            gs += 1
-
         ld = out['loss_dict']
         avg['total'] += ld.get('loss_total', 0)
         avg['lm'] += ld.get('loss_lm', 0)
         avg['pred'] += ld.get('loss_pred', 0)
-        avg['entropy'] += ld.get('loss_entropy', 0)
-        avg['ponder'] += ld.get('loss_ponder', 0)
         avg['eff_iters'] += out.get('effective_iters', 0)
         avg['eff_std'] += out.get('eff_iters_std', 0)
         avg['score_std'] += out.get('score_std', 0)
         avg_n += 1
 
-        if gs > 0 and gs % CFG['log_interval'] == 0 and (bi + 1) % CFG['grad_accum'] == 0:
-            n = max(avg_n, 1)
-            elapsed = _time.time() - _t0
-            eta_m = (elapsed / gs) * (max_steps - gs) / 60 if gs > 0 else 0
-            print('[Step %d/%d] loss=%.4f | lm=%.4f pred=%.4f ent=%.4f ponder=%.4f | '
-                  'eff_iters=%.2f±%.2f score_std=%.4f tau=%.3f | lr_base=%.2e lr_new=%.2e | ETA %.0fm' % (
-                gs, max_steps, avg['total']/n, avg['lm']/n, avg['pred']/n,
-                avg['entropy']/n, avg['ponder']/n, avg['eff_iters']/n, avg['eff_std']/n,
-                avg['score_std']/n, tau_halt,
-                optimizer.param_groups[0]['lr'], optimizer.param_groups[1]['lr'], eta_m))
-            avg = {'total': 0, 'lm': 0, 'pred': 0, 'entropy': 0, 'ponder': 0, 'eff_iters': 0, 'eff_std': 0, 'score_std': 0}
-            avg_n = 0
+    # Optimizer step
+    torch.nn.utils.clip_grad_norm_(model.parameters(), CFG['max_grad_norm'])
+    optimizer.step(); optimizer.zero_grad(); lr_sched.step()
 
-        if gs > 0 and gs % CFG['eval_interval'] == 0 and (bi + 1) % CFG['grad_accum'] == 0:
-            model.eval()
-            ev_loss, ev_n = 0, 0
-            with torch.no_grad():
-                for eb in eval_loader:
-                    eb = {k: v.to(device) for k, v in eb.items()}
-                    with torch.amp.autocast('cuda', dtype=DTYPE):
-                        eo = model(input_ids=eb['input_ids'],
-                                  attention_mask=eb['attention_mask'],
-                                  labels=eb['labels'])
-                    ev_loss += eo['loss_dict'].get('loss_lm', 0); ev_n += 1
-            avg_ev = ev_loss / max(ev_n, 1)
-            ppl = math.exp(min(avg_ev, 20))
-            print('  [Eval] loss=%.4f PPL=%.2f' % (avg_ev, ppl))
-            if avg_ev < best_eval:
-                best_eval = avg_ev
-                torch.save(model.state_dict(), 'output/cct/best_model.pt')
-                print('  New best!')
-            model.train()
+    # Logging
+    if (gs + 1) % CFG['log_interval'] == 0:
+        n = max(avg_n, 1)
+        elapsed = _time.time() - _t0
+        eta_m = (elapsed / (gs + 1)) * (max_steps - gs - 1) / 60
+        tokens_done = (gs + 1) * CFG['batch_size'] * CFG['grad_accum'] * CFG['max_seq_len']
+        print('[Step %d/%d] loss=%.4f | lm=%.4f pred=%.4f | '
+              'eff_iters=%.2f+/-%.2f score_std=%.4f tau=%.3f | '
+              'lr=%.2e | %.1fM tok | ETA %.0fm' % (
+            gs + 1, max_steps, avg['total']/n, avg['lm']/n, avg['pred']/n,
+            avg['eff_iters']/n, avg['eff_std']/n, avg['score_std']/n, tau_halt,
+            optimizer.param_groups[0]['lr'], tokens_done / 1e6, eta_m))
+        avg = {'total': 0, 'lm': 0, 'pred': 0, 'eff_iters': 0, 'eff_std': 0, 'score_std': 0}
+        avg_n = 0
 
-    print('Epoch %d done (%.1f min elapsed)' % (epoch + 1, (_time.time() - _t0) / 60))
+    # Eval
+    if (gs + 1) % CFG['eval_interval'] == 0:
+        model.eval()
+        ev_loss, ev_n = 0, 0
+        with torch.no_grad():
+            for eb in eval_loader:
+                eb = {k: v.to(device) for k, v in eb.items()}
+                with torch.amp.autocast('cuda', dtype=DTYPE):
+                    eo = model(input_ids=eb['input_ids'],
+                              attention_mask=eb['attention_mask'],
+                              labels=eb['labels'])
+                ev_loss += eo['loss_dict'].get('loss_lm', 0); ev_n += 1
+        avg_ev = ev_loss / max(ev_n, 1)
+        ppl = math.exp(min(avg_ev, 20))
+        print('  [Eval step %d] loss=%.4f PPL=%.2f' % (gs + 1, avg_ev, ppl))
+        if avg_ev < best_eval:
+            best_eval = avg_ev
+            torch.save(model.state_dict(), 'output/cct/best_model.pt')
+            print('  New best! Saved.')
+        model.train()
 
 torch.save(model.state_dict(), 'output/cct/final_model.pt')
-print('Training complete! Best eval: %.4f (%.1f min total)' % (
+print('\\nTraining complete! Best eval loss: %.4f (%.1f min total)' % (
     best_eval, (_time.time() - _t0) / 60))"""),
     ]
 
@@ -393,12 +393,15 @@ def cells_eval() -> List[dict]:
     return [
         md("## 4. 评估 (训练态 vs 推理态)"),
         code("""\
-# === 4. 评估: ACT 加权和 vs 硬停止 ===
+# === 4. 评估: 训练态 (ACT 加权和) vs 推理态 (硬停止) ===
+# effective_iters = per-token 期望迭代数 (加权平均, 可为小数, 如 2.3)
+# num_iterations = column 循环实际运行次数 (整数, 训练态=max_iter, 推理态<=max_iter)
 model.eval()
 
-def evaluate(model, loader):
+def evaluate(model, data_list, batch_size=32):
+    loader = DataLoader(ListDataset(data_list), batch_size=batch_size, num_workers=0)
     total_loss, count = 0, 0
-    all_iters = []
+    all_eff_iters, all_num_iters = [], []
     with torch.no_grad():
         for batch in loader:
             batch = {k: v.to(device) for k, v in batch.items()}
@@ -407,44 +410,50 @@ def evaluate(model, loader):
                            attention_mask=batch['attention_mask'],
                            labels=batch['labels'])
             total_loss += out['loss_dict'].get('loss_lm', 0)
-            all_iters.append(out.get('num_iterations', 0))
+            all_eff_iters.append(out.get('effective_iters', 0))
+            all_num_iters.append(out.get('num_iterations', 0))
             count += 1
     avg = total_loss / max(count, 1)
-    avg_iter = sum(all_iters) / max(len(all_iters), 1)
-    return avg, math.exp(min(avg, 20)), avg_iter
+    avg_eff = sum(all_eff_iters) / max(len(all_eff_iters), 1)
+    avg_num = sum(all_num_iters) / max(len(all_num_iters), 1)
+    return avg, math.exp(min(avg, 20)), avg_eff, avg_num
 
-# 训练态 (低 tau, ACT 加权和)
+# 训练态 (低 tau, ACT 加权和 — 所有 max_iter 轮都跑)
 model.set_halt_tau(cct_config.halt_tau_end)
 model.train()
-tl, tp, ti = evaluate(model, eval_loader)
+tl, tp, tei, tni = evaluate(model, eval_data, CFG['batch_size'])
 
-# 推理态 (硬停止)
+# 推理态 (硬停止 — remainder < threshold 时提前退出)
 model.eval()
-il, ip, ii = evaluate(model, eval_loader)
+il, ip, iei, ini = evaluate(model, eval_data, CFG['batch_size'])
 
 print()
-print('=' * 60)
-print('| Mode     | LM Loss | PPL    | Avg Iters | Gap    |')
-print('|----------|---------|--------|-----------|--------|')
-print('| Train    | %.4f  | %.2f | %.1f       | -      |' % (tl, tp, ti))
-print('| Infer    | %.4f  | %.2f | %.1f       | %+.4f |' % (il, ip, ii, il - tl))
-print('=' * 60)"""),
+print('=' * 70)
+print('| Mode  | LM Loss | PPL    | Eff Iters | Num Iters | Loss Gap |')
+print('|-------|---------|--------|-----------|-----------|----------|')
+print('| Train | %.4f  | %6.2f | %.2f      | %.1f       | -        |' % (tl, tp, tei, tni))
+print('| Infer | %.4f  | %6.2f | %.2f      | %.1f       | %+.4f   |' % (il, ip, iei, ini, il - tl))
+print('=' * 70)
+print()
+print('Eff Iters = per-token 期望迭代数 (加权平均)')
+print('Num Iters = column 循环实际运行次数 (训练态=max_iter, 推理态可提前退出)')"""),
     ]
 
 
 def cells_inference() -> List[dict]:
     return [
-        md("## 4.5 推理测试: 用 eval 集问题生成回答"),
+        md("## 4.5 推理测试: 文本续写"),
         code("""\
-# === 4.5 推理: 从 eval 集抽 5 个问题，生成回答并对比 ground truth ===
+# === 4.5 推理: 从 eval 数据截取 prompt -> 续写并对比 ===
 model.eval()
 
-# 简单贪心生成
 @torch.no_grad()
 def greedy_generate(model, input_ids, max_new_tokens=128):
     \"\"\"手动贪心解码 (CCTLlamaModel 无 .generate())\"\"\"
     ids = input_ids.clone()
     for _ in range(max_new_tokens):
+        if ids.size(1) > CFG['max_seq_len']:
+            ids = ids[:, -CFG['max_seq_len']:]
         with torch.amp.autocast('cuda', dtype=DTYPE):
             out = model(input_ids=ids)
         next_id = out['logits'][:, -1, :].argmax(dim=-1, keepdim=True)
@@ -453,46 +462,33 @@ def greedy_generate(model, input_ids, max_new_tokens=128):
             break
     return ids
 
-# 访问底层 SFTDataset.data (eval_ds 是 Subset)
-_base_ds = eval_ds.dataset if hasattr(eval_ds, 'dataset') else eval_ds
-
-# 从 eval 集随机抽 5 个样本
 import random
 random.seed(42)
-sample_indices = random.sample(range(len(eval_ds)), min(5, len(eval_ds)))
+sample_indices = random.sample(range(len(eval_data)), min(5, len(eval_data)))
 
 print('=' * 80)
-print('推理测试: eval 集中抽取 %d 个问题' % len(sample_indices))
+print('推理测试: 从 eval packed chunks 截取 prompt (前 256 tokens) -> 续写')
 print('=' * 80)
 
 for idx_i, si in enumerate(sample_indices):
-    # Subset: eval_ds.indices[si] → 原始 SFTDataset 的真实 index
-    real_idx = eval_ds.indices[si] if hasattr(eval_ds, 'indices') else si
-    text, prompt_len = _base_ds.data[real_idx]
-    prompt_ids = tokenizer(text, truncation=True, max_length=CFG['max_seq_len'],
-                          add_special_tokens=False)['input_ids'][:prompt_len]
-    full_ids = tokenizer(text, truncation=True, max_length=CFG['max_seq_len'],
-                        add_special_tokens=False)['input_ids']
-    gt_ids = full_ids[prompt_len:]
+    input_ids = eval_data[si]['input_ids']
+    prompt_len = 256
+    prompt_ids = input_ids[:prompt_len].unsqueeze(0).to(device)
+    gt_ids = input_ids[prompt_len:prompt_len + 128]
     gt_text = tokenizer.decode(gt_ids, skip_special_tokens=True)
 
-    input_tensor = torch.tensor([prompt_ids], device=device)
-    gen_ids = greedy_generate(model, input_tensor,
-                              max_new_tokens=min(256, len(gt_ids) + 50))
-    gen_text = tokenizer.decode(gen_ids[0][len(prompt_ids):], skip_special_tokens=True)
-    prompt_text = tokenizer.decode(prompt_ids, skip_special_tokens=True)
+    gen_ids = greedy_generate(model, prompt_ids, max_new_tokens=128)
+    gen_text = tokenizer.decode(gen_ids[0][prompt_len:], skip_special_tokens=True)
+    prompt_text = tokenizer.decode(prompt_ids[0], skip_special_tokens=True)
 
-    print('\\n--- Sample %d (eval idx=%d, real=%d) ---' % (idx_i + 1, si, real_idx))
-    print('[PROMPT] %s' % prompt_text[:300])
-    print('[GROUND TRUTH] %s' % gt_text[:500])
-    print('[MODEL OUTPUT] %s' % gen_text[:500])
-    match = gt_text.strip()[:100] == gen_text.strip()[:100]
-    print('[MATCH first 100 chars] %s' % ('YES ⚠️' if match else 'NO'))
+    print('\\n--- Sample %d (eval idx=%d) ---' % (idx_i + 1, si))
+    print('[PROMPT last 200 chars] ...%s' % prompt_text[-200:])
+    print('[GROUND TRUTH] %s' % gt_text[:300])
+    print('[MODEL OUTPUT] %s' % gen_text[:300])
     print()
 
 print('=' * 80)
-print('如果 MODEL OUTPUT ≈ GROUND TRUTH，说明模型可能记住了训练分布')
-print('(注: eval 集是从同一个数据集 random_split 出来的，但训练时未见过)')
+print('对比续写质量: 模型是否学到了文本分布')
 print('=' * 80)"""),
     ]
 
@@ -507,10 +503,11 @@ import numpy as np
 
 model.eval()
 all_scores_viz = []
-all_eff_iters_viz = []  # per-token effective iterations
+all_eff_iters_viz = []
 
+viz_loader = DataLoader(ListDataset(eval_data), batch_size=CFG['batch_size'], num_workers=0)
 with torch.no_grad():
-    for bi, batch in enumerate(eval_loader):
+    for bi, batch in enumerate(viz_loader):
         if bi >= 20: break
         batch = {k: v.to(device) for k, v in batch.items()}
         with torch.amp.autocast('cuda', dtype=DTYPE):
@@ -519,7 +516,6 @@ with torch.no_grad():
                        labels=batch['labels'])
         if out['scores']:
             all_scores_viz.append(out['scores'][-1].float().cpu())
-        # 从 p_halts 重建 per-token effective iterations
         if out['p_halts']:
             p_halts_cpu = [ph.float().cpu() for ph in out['p_halts']]
             remainder = torch.ones_like(p_halts_cpu[0])
@@ -527,14 +523,13 @@ with torch.no_grad():
             for k, ph in enumerate(p_halts_cpu):
                 eff += (k + 1) * remainder * ph
                 remainder = remainder * (1.0 - ph)
-            eff += len(p_halts_cpu) * remainder  # 剩余分配给最后一轮
+            eff += len(p_halts_cpu) * remainder
             mask = batch['attention_mask'][:, :eff.size(1)].cpu()
             eff_tokens = eff[mask.bool()].numpy()
             all_eff_iters_viz.append(eff_tokens)
 
 fig, axes = plt.subplots(1, 3, figsize=(15, 4))
 
-# (a) Score 分布
 if all_scores_viz:
     scores_flat = torch.cat(all_scores_viz).flatten().numpy()
     axes[0].hist(scores_flat, bins=50, alpha=0.7, color='steelblue')
@@ -544,7 +539,6 @@ if all_scores_viz:
                     label='mean=%.3f' % np.mean(scores_flat))
     axes[0].legend()
 
-# (b) Precision 分布
 if all_scores_viz:
     tau_p = cct_config.precision_temperature
     precision = 1.0 - 1.0 / (1.0 + np.exp(-scores_flat / tau_p))
@@ -555,7 +549,6 @@ if all_scores_viz:
                     label='mean=%.3f' % np.mean(precision))
     axes[1].legend()
 
-# (c) Per-token Effective Iterations 分布
 if all_eff_iters_viz:
     eff_flat = np.concatenate(all_eff_iters_viz)
     axes[2].hist(eff_flat, bins=50, alpha=0.7, color='seagreen')
@@ -564,7 +557,7 @@ if all_eff_iters_viz:
     mean_eff = np.mean(eff_flat)
     std_eff = np.std(eff_flat)
     axes[2].axvline(x=mean_eff, color='red', ls='--',
-                    label='mean=%.2f±%.2f' % (mean_eff, std_eff))
+                    label='mean=%.2f+/-%.2f' % (mean_eff, std_eff))
     axes[2].legend()
 
 plt.tight_layout()
