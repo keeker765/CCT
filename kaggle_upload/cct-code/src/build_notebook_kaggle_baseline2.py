@@ -178,14 +178,14 @@ assert DATA_DIR or DATA_FILE, '数据路径无效: %s' % MOUNT_DATA
 
 CFG = {{
     'max_steps': None,   # auto-compute from data
-    'batch_size': 32,
+    'batch_size': 16,
     'grad_accum': 1,
-    'max_seq_len': 512,
+    'max_seq_len': 2048,
     'lr': {lr},
     'max_grad_norm': 1.0,
     'weight_decay': 0.01,
     'warmup_steps': 50,
-    'log_interval': 20,
+    'log_interval': 5,
     'eval_interval': 100,
     'eval_chunks': 100,
     'save_interval': 500,

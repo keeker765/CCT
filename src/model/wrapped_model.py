@@ -464,6 +464,7 @@ class CCTLlamaModel(nn.Module):
                 entropies=all_entropies,
                 lambda_mono=self.config.lambda_mono,
                 valid_mask=valid_mask,
+                entropy_floor=self.config.entropy_floor,
             )
 
         # 报告每次迭代的 mean±std entropy (仅有效 token)

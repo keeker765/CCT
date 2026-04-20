@@ -49,9 +49,10 @@ class CCTConfig:
     # Entropy-based halt (v2)
     lambda_mono: float = 0.3         # L_mono 相对权重 (0.3 = 30% of LM, 自适应缩放)
     entropy_temp_scale: float = 0.5  # per-query temperature: temp = 1 - scale * H_norm
-    halt_entropy_threshold: float = 0.1  # 推理硬停止最终阈值
-    halt_threshold_start: float = 0.3    # 退火起始阈值 (训练初期 eval 较宽松)
-    halt_threshold_end: float = 0.1      # 退火结束阈值 (= halt_entropy_threshold)
+    entropy_floor: float = 0.15      # L_mono entropy 地板: H_norm < floor 时不再奖励降低
+    halt_entropy_threshold: float = 0.2  # 推理硬停止最终阈值
+    halt_threshold_start: float = 0.5    # 退火起始阈值 (训练初期 eval 较宽松)
+    halt_threshold_end: float = 0.2      # 退火结束阈值 (= halt_entropy_threshold)
 
     # 训练
     learning_rate: float = 2e-5
