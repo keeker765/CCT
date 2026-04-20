@@ -60,27 +60,22 @@ def compute_monotonic_entropy_loss(
     max_iter: int = 10,
     delta_max: float = 0.08,
 ) -> torch.Tensor:
-    """L_mono (Pace-Constrained): 双向惩罚，控制 entropy 下降节奏
+    """L_mono (Pace-Constrained + Bounded Reward): 控制 entropy 下降节奏
 
     对每对相邻迭代:
       diff = H[k+1] - H[k]
-      increase_penalty = max(0, diff)           # 惩罚 entropy 上升
-      rush_penalty     = max(0, -diff - delta_max) # 惩罚下降过快
+      increase_penalty = max(0, diff)               # 惩罚 entropy 上升
+      rush_penalty     = max(0, -diff - delta_max)   # 惩罚下降过快
+      decrease_reward  = clamp(-diff, 0, delta_max)  # 奖励适度下降 (有上界)
 
-    L_mono = mean(increase_penalty + rush_penalty) / (K-1)
+    L_mono = mean(increase_penalty + rush_penalty - decrease_reward) / (K-1)
 
-    entropy 在 [0, -delta_max] 范围内下降 → 无惩罚 (loss=0)
-
-    Args:
-        entropies: [H_0, H_1, ..., H_{K-1}], 每个 [B, T]
-        valid_mask: [B, T] — 1=有效, 0=padding
-        entropy_floor: H_norm 下限 (默认 0.0 = 无下限)
-        iter_active: per-iteration per-sample active mask (None = all active)
-        max_iter: 最大迭代数 (unused, kept for API compatibility)
-        delta_max: 允许的最大每步降幅 (默认 0.08 → ~3 iters at H0=0.45)
+    - 崩塌到 0 (diff=-0.35): rush_penalty=0.27 > reward=0.08 → 净惩罚 +0.19
+    - 适度下降 (diff=-0.05): reward=0.05, no penalty → 净奖励 -0.05
+    - 不下降 (diff=0): 全部为 0 → 无信号
 
     Returns:
-        l_mono: 标量 (≥ 0)
+        l_mono: 标量 (可为负 = 奖励)
     """
     if len(entropies) < 2:
         return torch.tensor(0.0, device=entropies[0].device)
@@ -95,24 +90,23 @@ def compute_monotonic_entropy_loss(
     for k in range(len(entropies) - 1):
         diff = entropies[k + 1] - entropies[k]  # [B, T]
 
-        # 双向惩罚
         increase_penalty = diff.clamp(min=0)              # 上升 → 惩罚
         rush_penalty = (-diff - delta_max).clamp(min=0)   # 下降超过 delta_max → 惩罚
+        decrease_reward = (-diff).clamp(min=0, max=delta_max)  # 适度下降 → 奖励 (有上界)
 
-        penalty = increase_penalty + rush_penalty  # [B, T], ≥ 0
+        step_val = increase_penalty + rush_penalty - decrease_reward  # [B, T]
 
-        # 两个迭代都 active 的样本才计入
         if iter_active is not None and k + 1 < len(iter_active):
-            both = (iter_active[k] & iter_active[k + 1]).float()[:, None]  # [B, 1]
+            both = (iter_active[k] & iter_active[k + 1]).float()[:, None]
         else:
             both = 1.0
 
         if valid_mask is not None:
             mask = valid_mask * both
             denom = mask.sum().clamp(min=eps)
-            step_loss = (penalty * mask).sum() / denom
+            step_loss = (step_val * mask).sum() / denom
         else:
-            step_loss = (penalty * both).sum() / (both.sum() * penalty.size(1)).clamp(min=eps)
+            step_loss = (step_val * both).sum() / (both.sum() * step_val.size(1)).clamp(min=eps)
 
         loss = loss + step_loss
         n_diffs += 1

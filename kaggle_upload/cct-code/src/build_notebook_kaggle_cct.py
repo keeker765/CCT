@@ -856,7 +856,7 @@ if train_files is not None:
             avg_ev_ent = ev_ent / max(ev_n, 1)
             avg_ev_iters = ev_iters / max(ev_n, 1)
             print('  [Eval step %d] loss=%.4f PPL=%.2f H=%.3f iters=%.1f th=%.3f' % (
-                gs + 1, avg_ev, ppl, avg_ev_ent, avg_ev_iters, halt_th))
+                gs + 1, avg_ev, ppl, avg_ev_ent, avg_ev_iters, cct_config.halt_entropy_threshold))
             if avg_ev < best_eval:
                 best_eval = avg_ev
                 torch.save(model.state_dict(), '/kaggle/working/output/best_model.pt')
@@ -959,7 +959,7 @@ else:
                     avg_ev_ent = ev_ent / max(ev_n, 1)
                     avg_ev_iters = ev_iters / max(ev_n, 1)
                     print('  [Eval] loss=%.4f PPL=%.2f H=%.3f iters=%.1f th=%.3f' % (
-                        avg_ev, ppl, avg_ev_ent, avg_ev_iters, halt_th))
+                        avg_ev, ppl, avg_ev_ent, avg_ev_iters, cct_config.halt_entropy_threshold))
                     if avg_ev < best_eval:
                         best_eval = avg_ev
                         torch.save(model.state_dict(), '/kaggle/working/output/best_model.pt')

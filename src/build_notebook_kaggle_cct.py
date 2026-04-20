@@ -263,7 +263,7 @@ CFG = {
     'entropy_floor': 0.15,
     'delta_max': 0.08,      # L_mono 每步最大允许降幅 (控制迭代节奏)
     'halt_threshold': 0.2,  # 固定 halt 阈值 (不退火)
-    'use_fusion_graft': True,
+    'use_fusion_graft': False,
     'fusion_rank': 64,
 }
 
