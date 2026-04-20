@@ -493,6 +493,10 @@ class CCTLlamaModel(nn.Module):
                     mean_entropy = last_h.mean().item()
                     std_entropy = last_h.std().item()
 
+            # 补齐到 max_iter (未执行的迭代显示 0)
+            while len(per_iter_entropy) < self.config.max_iter:
+                per_iter_entropy.append((0.0, 0.0))
+
         return {
             "loss": loss,
             "logits": logits,
