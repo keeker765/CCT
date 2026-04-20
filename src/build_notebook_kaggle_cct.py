@@ -238,7 +238,7 @@ from torch.utils.data import DataLoader, Dataset, random_split
 
 from src.model.wrapped_model import CCTLlamaModel
 from src.model.column_config import CCTConfig
-from src.training.scheduler import get_cosine_schedule_with_warmup, compute_halt_threshold
+from src.training.scheduler import get_cosine_schedule_with_warmup
 
 # === 超参数 ===
 CFG = {
@@ -262,9 +262,7 @@ CFG = {
     'entropy_temp_scale': 0.5,
     'entropy_floor': 0.15,
     'delta_max': 0.08,      # L_mono 每步最大允许降幅 (控制迭代节奏)
-    'halt_threshold_start': 0.5,
-    'halt_threshold_end': 0.2,
-    'halt_warmup_ratio': 0.1,  # halt threshold warmup 占总步数比例
+    'halt_threshold': 0.2,  # 固定 halt 阈值 (不退火)
     'use_fusion_graft': True,
     'fusion_rank': 64,
 }
@@ -422,9 +420,7 @@ cct_config = CCTConfig(
     entropy_temp_scale=CFG['entropy_temp_scale'],
     entropy_floor=CFG['entropy_floor'],
     delta_max=CFG['delta_max'],
-    halt_threshold_start=CFG['halt_threshold_start'],
-    halt_threshold_end=CFG['halt_threshold_end'],
-    halt_entropy_threshold=CFG['halt_threshold_end'],
+    halt_entropy_threshold=CFG['halt_threshold'],
     use_ffn_expansion=False,
     use_fusion_graft=CFG['use_fusion_graft'],
     fusion_rank=CFG['fusion_rank'],
@@ -812,7 +808,7 @@ if train_files is not None:
                 s = sum(stds) / len(stds) if stds else 0
                 h_parts.append('%.3f±%.3f' % (m, s))
             h_str = '[' + ', '.join(h_parts) + ']'
-            th = compute_halt_threshold(gs + 1, max_steps, cct_config.halt_threshold_start, cct_config.halt_threshold_end, warmup_steps=int(max_steps * CFG['halt_warmup_ratio']))
+            th = cct_config.halt_entropy_threshold
             log_msg = ('[Step %d/%d] loss=%.4f | lm=%.4f Δh=%+.4f mse=%.4f | '
                   'H=%s iters=%.1f±%.1f th=%.3f | '
                   'lr=%.2e | %.1fM tok | ETA %.0fm' % (
@@ -840,12 +836,6 @@ if train_files is not None:
 
         # === 定期 Eval ===
         if (gs + 1) % CFG['eval_interval'] == 0:
-            # 退火 halt 阈值
-            halt_th = compute_halt_threshold(gs + 1, max_steps,
-                                             cct_config.halt_threshold_start,
-                                             cct_config.halt_threshold_end,
-                                             warmup_steps=int(max_steps * CFG['halt_warmup_ratio']))
-            model.set_halt_threshold(halt_th)
             model.eval()
             ev_loss, ev_n, ev_ent, ev_iters = 0, 0, 0, 0
             with torch.no_grad():
@@ -925,7 +915,7 @@ else:
                         s = sum(stds) / len(stds) if stds else 0
                         h_parts.append('%.3f±%.3f' % (m, s))
                     h_str = '[' + ', '.join(h_parts) + ']'
-                    th = compute_halt_threshold(gs_count, max_steps, cct_config.halt_threshold_start, cct_config.halt_threshold_end, warmup_steps=int(max_steps * CFG['halt_warmup_ratio']))
+                    th = cct_config.halt_entropy_threshold
                     log_msg = ('[Step %d/%d] loss=%.4f | lm=%.4f Δh=%+.4f mse=%.4f | '
                           'H=%s iters=%.1f±%.1f th=%.3f | '
                           'lr=%.2e | %.1fM tok | ETA %.0fm' % (
@@ -949,11 +939,6 @@ else:
                     _timeout_exit = True
                     break
                 if gs_count % CFG['eval_interval'] == 0:
-                    halt_th = compute_halt_threshold(gs_count, max_steps,
-                                                     cct_config.halt_threshold_start,
-                                                     cct_config.halt_threshold_end,
-                                                     warmup_steps=int(max_steps * CFG['halt_warmup_ratio']))
-                    model.set_halt_threshold(halt_th)
                     model.eval()
                     ev_loss, ev_n, ev_ent, ev_iters = 0, 0, 0, 0
                     with torch.no_grad():
