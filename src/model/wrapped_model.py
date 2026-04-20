@@ -429,6 +429,15 @@ class CCTLlamaModel(nn.Module):
             n: p.detach() for n, p in self.entropy_probe.named_parameters()
         }
 
+        # 随机选择 checkpoint 迭代: 最后一轮必选, 再随机选 1 轮
+        # 分散 probe MSE 训练信号到所有迭代深度 (不只是 0 和 K-1)
+        max_k = self.config.max_iter
+        if self.training and max_k > 2:
+            random_idx = torch.randint(0, max_k - 1, (1,)).item()  # [0, K-2]
+            grad_iters = {random_idx, max_k - 1}
+        else:
+            grad_iters = {0, max_k - 1}  # 推理/max_iter<=2: 固定首尾
+
         for k in range(self.config.max_iter):
             active = ~halted  # [B] — samples still active at start of this iter
             iter_active.append(active.clone())
@@ -469,7 +478,7 @@ class CCTLlamaModel(nn.Module):
             # c. Entropy + LM loss (方案 B: 中间迭代完全跳过 lm_head)
             # checkpoint 迭代: 真实 entropy + LM loss (back→norm→lm_head, 有梯度)
             # 中间迭代: 只用 probe(h) 预测 entropy, 无 lm_head → 快 500×
-            is_grad_iter = (k == 0 or k == self.config.max_iter - 1)
+            is_grad_iter = (k in grad_iters)
 
             if is_grad_iter:
                 # 真实 entropy + LM loss (checkpoint: 反向时重算)
