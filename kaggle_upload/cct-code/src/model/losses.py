@@ -3,7 +3,8 @@
 L_total = mean(L_LM_k, weighted by active mask) + λ_mono · L_mono
 
 - L_LM_k: 每次迭代通过 back+norm+lm_head 的 CrossEntropy (per-sample)
-- L_mono: ReLU(H_{k+1} - H_k) — 仅惩罚 entropy 上升，不奖励下降
+- L_mono: clamp(H_{k+1} - H_k, min=-2/max_iter) — 惩罚 entropy 上升，
+  允许少量负值奖励 entropy 下降，但下限与 max_iter 挂钩防止跑飞
 - per-sample halt: 不同样本在不同迭代停止，只计入 active 迭代的损失
 """
 
@@ -54,25 +55,25 @@ def compute_monotonic_entropy_loss(
     valid_mask: Optional[torch.Tensor] = None,
     entropy_floor: float = 0.0,
     iter_active: Optional[List[torch.Tensor]] = None,
+    max_iter: int = 10,
 ) -> torch.Tensor:
-    """L_mono: 惩罚 entropy 在相邻迭代间递增 (单向 ReLU)
+    """L_mono: 惩罚 entropy 在相邻迭代间递增，允许有限负奖励
 
-    L_mono = Σ_{k=0}^{K-2} masked_mean(ReLU(H_{k+1} - H_k)) / (K-1)
+    L_mono = Σ_{k=0}^{K-2} masked_mean(clamp(H_{k+1} - H_k, min=-2/max_iter)) / (K-1)
 
-    仅惩罚 entropy 上升 (正 diff)，不奖励 entropy 下降。
-    这样避免 lambda_mono 过大时总 loss 变负。
-
-    entropy_floor: H_norm 低于此值后 diff 被 clamp → 不惩罚也不奖励
-    iter_active: [active_0, active_1, ...] 每个 [B] bool — per-sample active mask
+    - diff > 0: 完全惩罚 entropy 上升
+    - diff < 0: 奖励 entropy 下降，但 clamp 在 -2/max_iter 防止跑飞
+    - max_iter=10 时下限 = -0.2，max_iter=6 时下限 ≈ -0.333
 
     Args:
         entropies: [H_0, H_1, ..., H_{K-1}], 每个 [B, T]
         valid_mask: [B, T] — 1=有效, 0=padding
         entropy_floor: H_norm 下限 (默认 0.0 = 无下限)
         iter_active: per-iteration per-sample active mask (None = all active)
+        max_iter: 最大迭代数，用于计算 diff 下限
 
     Returns:
-        l_mono: 标量 (≥0)
+        l_mono: 标量 (可能为负，但有下限)
     """
     if len(entropies) < 2:
         return torch.tensor(0.0, device=entropies[0].device)
@@ -80,12 +81,13 @@ def compute_monotonic_entropy_loss(
     if entropy_floor > 0:
         entropies = [e.clamp(min=entropy_floor) for e in entropies]
 
+    diff_floor = -2.0 / max(max_iter, 1)
     eps = 1e-8
     loss = torch.tensor(0.0, device=entropies[0].device)
     n_diffs = 0
 
     for k in range(len(entropies) - 1):
-        diff = F.relu(entropies[k + 1] - entropies[k])  # [B, T], only penalize increase
+        diff = (entropies[k + 1] - entropies[k]).clamp(min=diff_floor)  # [B, T]
 
         # 两个迭代都 active 的样本才计入
         if iter_active is not None and k + 1 < len(iter_active):
@@ -113,6 +115,7 @@ def compute_total_loss(
     valid_mask: Optional[torch.Tensor] = None,
     entropy_floor: float = 0.0,
     iter_active: Optional[List[torch.Tensor]] = None,
+    max_iter: int = 10,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """计算总损失 (直接相加, per-sample halt)
 
@@ -125,6 +128,7 @@ def compute_total_loss(
         valid_mask: [B, T] — padding mask
         entropy_floor: H_norm 下限
         iter_active: per-iteration per-sample active mask [B] bools
+        max_iter: 最大迭代数 (用于 diff clamp 下限)
 
     Returns:
         total_loss: 总损失
@@ -141,9 +145,9 @@ def compute_total_loss(
     else:
         lm_loss = stacked.mean()
 
-    # L_mono (with per-sample active masking)
+    # L_mono (with per-sample active masking and diff clamp)
     l_mono = compute_monotonic_entropy_loss(
-        entropies, valid_mask, entropy_floor, iter_active
+        entropies, valid_mask, entropy_floor, iter_active, max_iter
     )
 
     # 直接相加 (无自适应缩放)

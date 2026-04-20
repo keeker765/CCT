@@ -47,7 +47,7 @@ class CCTConfig:
     fusion_freeze_base: bool = False # True=冻结被包装的基础权重, 仅训练 A/B
 
     # Entropy-based halt (v2)
-    lambda_mono: float = 100.0       # L_mono 权重 (直接乘以 l_mono 相加)
+    lambda_mono: float = 1.0        # L_mono 权重 (直接乘以 l_mono 相加)
     entropy_temp_scale: float = 0.5  # per-query temperature: temp = 1 - scale * H_norm
     entropy_floor: float = 0.15      # L_mono entropy 地板: H_norm < floor 时不再奖励降低
     halt_entropy_threshold: float = 0.2  # 推理硬停止最终阈值
