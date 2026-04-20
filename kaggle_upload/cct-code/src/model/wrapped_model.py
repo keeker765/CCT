@@ -448,30 +448,18 @@ class CCTLlamaModel(nn.Module):
                 break
 
             # a. 3个 CCTDecoderLayer forward (共享权重)
+            # Column 层不用 gradient_checkpoint (102 GB VRAM 够用, 省去 recompute)
             for ci, col_layer in enumerate(self.column_layers):
                 col_cycle_k = k * len(self.column_layers) + ci
                 col_temp = entropy_temperature if ci == 0 else None
-                if self._gradient_checkpointing and self.training:
-                    h = torch.utils.checkpoint.checkpoint(
-                        col_layer, h.to(self._model_dtype),
-                        column_mask,
-                        position_ids,
-                        None,  # past_key_values
-                        position_embeddings,
-                        col_cycle_k,
-                        None,  # precision_bias (deprecated)
-                        col_temp,
-                        use_reentrant=False,
-                    )
-                else:
-                    h = col_layer(
-                        h.to(self._model_dtype),
-                        attention_mask=column_mask,
-                        position_ids=position_ids,
-                        position_embeddings=position_embeddings,
-                        cycle_k=col_cycle_k,
-                        entropy_temperature=col_temp,
-                    )
+                h = col_layer(
+                    h.to(self._model_dtype),
+                    attention_mask=column_mask,
+                    position_ids=position_ids,
+                    position_embeddings=position_embeddings,
+                    cycle_k=col_cycle_k,
+                    entropy_temperature=col_temp,
+                )
 
             # b. 迭代间 RMSNorm (防发散)
             h = self.inter_iter_norm(h)

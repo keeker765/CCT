@@ -245,7 +245,7 @@ CFG = {
     'max_steps': None,    # None = 自动按数据量算 (1 epoch)
     'batch_size': 16,
     'grad_accum': 2,
-    'max_seq_len': 2048,
+    'max_seq_len': 1024,
     'lr': 2e-5,
     'new_lr': 5e-4,
     'max_grad_norm': 1.0,
@@ -769,6 +769,10 @@ if train_files is not None:
                                     batch_size=CFG['batch_size'], shuffle=True)
             batch = next(iter(batch_loader))
             batch = {k: v.to(device) for k, v in batch.items()}
+            # 截断到 max_seq_len (prepacked data 可能更长)
+            _sl = CFG['max_seq_len']
+            if batch['input_ids'].size(1) > _sl:
+                batch = {k: v[:, :_sl] for k, v in batch.items()}
 
             with torch.amp.autocast('cuda', dtype=DTYPE):
                 out = model(input_ids=batch['input_ids'],
@@ -845,6 +849,9 @@ if train_files is not None:
             with torch.no_grad():
                 for eb in eval_loader:
                     eb = {k: v.to(device) for k, v in eb.items()}
+                    _sl = CFG['max_seq_len']
+                    if eb['input_ids'].size(1) > _sl:
+                        eb = {k: v[:, :_sl] for k, v in eb.items()}
                     with torch.amp.autocast('cuda', dtype=DTYPE):
                         eo = model(input_ids=eb['input_ids'],
                                   attention_mask=eb['attention_mask'],
@@ -950,6 +957,9 @@ else:
                     with torch.no_grad():
                         for eb in eval_loader:
                             eb = {k: v.to(device) for k, v in eb.items()}
+                            _sl = CFG['max_seq_len']
+                            if eb['input_ids'].size(1) > _sl:
+                                eb = {k: v[:, :_sl] for k, v in eb.items()}
                             with torch.amp.autocast('cuda', dtype=DTYPE):
                                 eo = model(input_ids=eb['input_ids'],
                                           attention_mask=eb['attention_mask'],
