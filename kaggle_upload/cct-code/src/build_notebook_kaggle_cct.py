@@ -245,7 +245,7 @@ CFG = {
     'max_steps': None,    # None = 自动按数据量算 (1 epoch)
     'batch_size': 16,
     'grad_accum': 2,
-    'max_seq_len': 1024,
+    'max_seq_len': 2048,
     'lr': 2e-5,
     'new_lr': 5e-4,
     'max_grad_norm': 1.0,
