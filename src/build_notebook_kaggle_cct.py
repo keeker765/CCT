@@ -746,7 +746,7 @@ if start_step > 0:
 else:
     print('Training for %d optimizer steps (grad_accum=%d)...' % (max_steps, CFG['grad_accum']))
 
-avg = {'total': 0, 'lm': 0, 'mono': 0, 'iters': 0, 'iters_std': 0}
+avg = {'total': 0, 'lm': 0, 'mono': 0, 'probe': 0, 'iters': 0, 'iters_std': 0}
 avg_h_per_iter = []  # list of lists: each inner list = per-iter entropy for one step
 avg_n = 0
 _last_loss = 0.0
@@ -781,6 +781,7 @@ if train_files is not None:
             avg['total'] += ld.get('loss_total', 0)
             avg['lm'] += ld.get('loss_lm', 0)
             avg['mono'] += ld.get('loss_mono', 0)
+            avg['probe'] += ld.get('loss_probe_mse', 0)
             avg['iters'] += out.get('num_iterations', 0)
             avg['iters_std'] += out.get('halt_iter_std', 0)
             avg_h_per_iter.append(out.get('per_iter_entropy', []))
@@ -806,10 +807,10 @@ if train_files is not None:
                 h_parts.append('%.3f±%.3f' % (m, s))
             h_str = '[' + ', '.join(h_parts) + ']'
             th = compute_halt_threshold(gs + 1, max_steps, cct_config.halt_threshold_start, cct_config.halt_threshold_end, warmup_steps=int(max_steps * CFG['halt_warmup_ratio']))
-            log_msg = ('[Step %d/%d] loss=%.4f | lm=%.4f Δh=%+.4f | '
+            log_msg = ('[Step %d/%d] loss=%.4f | lm=%.4f Δh=%+.4f mse=%.4f | '
                   'H=%s iters=%.1f±%.1f th=%.3f | '
                   'lr=%.2e | %.1fM tok | ETA %.0fm' % (
-                gs + 1, max_steps, avg['total']/n, avg['lm']/n, avg['mono']/n,
+                gs + 1, max_steps, avg['total']/n, avg['lm']/n, avg['mono']/n, avg['probe']/n,
                 h_str, avg['iters']/n, avg['iters_std']/n, th,
                 optimizer.param_groups[0]['lr'], tokens_done / 1e6, eta_m))
             # 融合量 (每 50 个 log interval 报告一次)
@@ -819,7 +820,7 @@ if train_files is not None:
                     fstr = ' '.join(['%s=%.4f' % (k, v) for k, v in sorted(fmag.items())[:8]])
                     log_msg += '\\n  [Fusion] ' + fstr
             print(log_msg)
-            avg = {'total': 0, 'lm': 0, 'mono': 0, 'iters': 0, 'iters_std': 0}
+            avg = {'total': 0, 'lm': 0, 'mono': 0, 'probe': 0, 'iters': 0, 'iters_std': 0}
             avg_h_per_iter = []
             avg_n = 0
 
@@ -895,6 +896,7 @@ else:
                 avg['total'] += ld.get('loss_total', 0)
                 avg['lm'] += ld.get('loss_lm', 0)
                 avg['mono'] += ld.get('loss_mono', 0)
+                avg['probe'] += ld.get('loss_probe_mse', 0)
                 avg['iters'] += out.get('num_iterations', 0)
                 avg['iters_std'] += out.get('halt_iter_std', 0)
                 avg_h_per_iter.append(out.get('per_iter_entropy', []))
@@ -915,11 +917,11 @@ else:
                         h_parts.append('%.3f±%.3f' % (m, s))
                     h_str = '[' + ', '.join(h_parts) + ']'
                     th = compute_halt_threshold(gs_count, max_steps, cct_config.halt_threshold_start, cct_config.halt_threshold_end, warmup_steps=int(max_steps * CFG['halt_warmup_ratio']))
-                    log_msg = ('[Step %d/%d] loss=%.4f | lm=%.4f Δh=%+.4f | '
+                    log_msg = ('[Step %d/%d] loss=%.4f | lm=%.4f Δh=%+.4f mse=%.4f | '
                           'H=%s iters=%.1f±%.1f th=%.3f | '
                           'lr=%.2e | %.1fM tok | ETA %.0fm' % (
                         gs_count, max_steps, avg['total']/n, avg['lm']/n,
-                        avg['mono']/n, h_str, avg['iters']/n, avg['iters_std']/n, th,
+                        avg['mono']/n, avg['probe']/n, h_str, avg['iters']/n, avg['iters_std']/n, th,
                         optimizer.param_groups[0]['lr'], tokens_done / 1e6, eta_m))
                     if cct_config.use_fusion_graft and gs_count % (CFG['log_interval'] * 50) == 0:
                         fmag = model.get_fusion_magnitudes()
@@ -927,7 +929,7 @@ else:
                             fstr = ' '.join(['%s=%.4f' % (k, v) for k, v in sorted(fmag.items())[:8]])
                             log_msg += '\\n  [Fusion] ' + fstr
                     print(log_msg)
-                    avg = {'total': 0, 'lm': 0, 'mono': 0, 'iters': 0, 'iters_std': 0}
+                    avg = {'total': 0, 'lm': 0, 'mono': 0, 'probe': 0, 'iters': 0, 'iters_std': 0}
                     avg_h_per_iter = []
                     avg_n = 0
                 # 超时检查
