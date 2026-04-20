@@ -33,7 +33,7 @@ except ImportError:
 from .column_config import CCTConfig
 from .cct_decoder_layer import CCTDecoderLayer
 from .cycle_embedding import RotaryCycleEmbedding
-from .losses import compute_total_loss
+from .losses import compute_monotonic_entropy_loss
 from .entropy_probe import EntropyProbe
 from .net2wider import widen_mlp, widen_mlp_cross_layer, auto_donor_mapping
 from .fusegpt_graft import (
@@ -466,55 +466,64 @@ class CCTLlamaModel(nn.Module):
             # b. 迭代间 RMSNorm (防发散)
             h = self.inter_iter_norm(h)
 
-            # c. Entropy + LM loss
-            # 首尾迭代: checkpoint (有梯度, 用于 LM loss backward)
-            # 中间迭代: no_grad forward-only (省去 backward, 用于温度/halt/probe MSE)
+            # c. Entropy + LM loss (方案 B: 中间迭代完全跳过 lm_head)
+            # checkpoint 迭代: 真实 entropy + LM loss (back→norm→lm_head, 有梯度)
+            # 中间迭代: 只用 probe(h) 预测 entropy, 无 lm_head → 快 500×
             is_grad_iter = (k == 0 or k == self.config.max_iter - 1)
 
             if is_grad_iter:
+                # 真实 entropy + LM loss (checkpoint: 反向时重算)
                 entropy, h_norm, lm_loss_k = torch.utils.checkpoint.checkpoint(
                     self._compute_entropy_and_lm_loss,
                     h, labels, layer_kwargs,
                     use_reentrant=False,
                 )
+                all_entropies.append(h_norm)
+                if lm_loss_k is not None:
+                    all_lm_losses.append(lm_loss_k)
+
+                # Probe MSE: 用真实 entropy 训练 probe
+                if self.training and labels is not None:
+                    probe_h_norm = self.entropy_probe(h)
+                    probe_mse = F.mse_loss(probe_h_norm, h_norm.detach())
+                    all_probe_mse.append(probe_mse)
             else:
-                with torch.no_grad():
-                    entropy, h_norm, lm_loss_k = self._compute_entropy_and_lm_loss(
-                        h, labels, layer_kwargs,
-                    )
+                # 中间迭代: 完全跳过 lm_head, 只用 probe
+                if self.training and labels is not None:
+                    probe_h_norm = self.entropy_probe(h).detach()  # detached for temperature/halt
+                else:
+                    # 推理时仍需真实 entropy (用于 halt 准确性)
+                    with torch.no_grad():
+                        _, h_norm, _ = self._compute_entropy_and_lm_loss(
+                            h, labels, layer_kwargs,
+                        )
+                    probe_h_norm = h_norm  # 推理用真实值
+                all_entropies.append(probe_h_norm)
 
-            # d. Probe entropy (MSE 训练路径: 梯度流向 probe 权重 + h)
+            # d. Probe for L_mono (functional_call: 梯度→h, 不→probe权重)
             if self.training and labels is not None:
-                probe_h_norm = self.entropy_probe(h)  # [B, T]
-                probe_mse = F.mse_loss(probe_h_norm, h_norm.detach())
-                all_probe_mse.append(probe_mse)
-
-                # L_mono 路径: functional_call + detached params
-                # 梯度只流向 h (column layers), 不流向 probe 权重
                 probe_for_mono = torch.func.functional_call(
                     self.entropy_probe, probe_detached_params, (h,),
                 )
                 all_probe_entropies.append(probe_for_mono)
 
-            all_entropies.append(h_norm)
-            if lm_loss_k is not None:
-                all_lm_losses.append(lm_loss_k)  # [B] per-sample
-
             num_iters_executed = k + 1
 
-            # e. Per-query temperature for next iteration (用真实 entropy, detached)
+            # e. Per-query temperature (用 all_entropies 中最新值, detached)
+            last_entropy = all_entropies[-1]
             entropy_temperature = (
-                1.0 - self.config.entropy_temp_scale * h_norm.detach()
+                1.0 - self.config.entropy_temp_scale * last_entropy.detach()
             ).clamp(min=0.5, max=1.0)  # [B, T]
 
-            # f. Per-sample halt check (用真实 entropy)
+            # f. Per-sample halt check
             if k >= self.config.min_iter - 1:
+                h_for_halt = last_entropy.detach()
                 if attention_mask is not None:
                     valid_tok = attention_mask[:, :seq_len].bool()  # [B, T]
                     denom = valid_tok.float().sum(dim=-1).clamp(min=1)  # [B]
-                    sample_h = (h_norm * valid_tok.float()).sum(dim=-1) / denom  # [B]
+                    sample_h = (h_for_halt * valid_tok.float()).sum(dim=-1) / denom  # [B]
                 else:
-                    sample_h = h_norm.mean(dim=-1)  # [B]
+                    sample_h = h_for_halt.mean(dim=-1)  # [B]
 
                 newly_halted = active & (sample_h < self.config.halt_entropy_threshold)
                 if newly_halted.any():
@@ -552,24 +561,32 @@ class CCTLlamaModel(nn.Module):
             if attention_mask is not None:
                 valid_mask = valid_mask * attention_mask[:, :seq_len].float()
 
-            # L_mono 使用 probe entropy (所有迭代有梯度, 且不优化 probe 权重)
-            mono_entropies = all_probe_entropies if all_probe_entropies else all_entropies
+            # LM loss: 直接平均 checkpoint 迭代的 LM losses
+            # 方案 B: 只有 checkpoint 迭代 (iter 0, K-1) 有 LM loss
+            lm_loss = torch.stack(all_lm_losses).mean(dim=0).mean()
 
-            loss, loss_dict = compute_total_loss(
-                per_sample_lm_losses=all_lm_losses,
-                entropies=mono_entropies,
-                lambda_mono=self.config.lambda_mono,
-                valid_mask=valid_mask,
-                entropy_floor=self.config.entropy_floor,
-                iter_active=iter_active,
-                max_iter=self.config.max_iter,
+            # L_mono: probe entropy (所有迭代有梯度, 不优化 probe 权重)
+            mono_entropies = all_probe_entropies if all_probe_entropies else all_entropies
+            l_mono = compute_monotonic_entropy_loss(
+                mono_entropies, valid_mask, self.config.entropy_floor,
+                iter_active, self.config.max_iter,
             )
+
+            total = lm_loss + self.config.lambda_mono * l_mono
+            loss_dict = {
+                "loss_total": total.item(),
+                "loss_lm": lm_loss.item(),
+                "loss_mono": l_mono.item(),
+            }
 
             # Probe MSE loss
             if all_probe_mse:
                 probe_mse_loss = torch.stack(all_probe_mse).mean()
-                loss = loss + probe_mse_loss
+                total = total + probe_mse_loss
                 loss_dict["loss_probe_mse"] = probe_mse_loss.item()
+                loss_dict["loss_total"] = total.item()
+
+            loss = total
 
         # 报告每次迭代的 mean±std entropy (仅有效 token)
         mean_entropy = 0.0
