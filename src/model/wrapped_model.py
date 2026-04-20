@@ -33,7 +33,7 @@ except ImportError:
 from .column_config import CCTConfig
 from .cct_decoder_layer import CCTDecoderLayer
 from .cycle_embedding import RotaryCycleEmbedding
-from .losses import compute_lm_loss, compute_total_loss
+from .losses import compute_lm_loss, compute_lm_loss_per_sample, compute_total_loss
 from .net2wider import widen_mlp, widen_mlp_cross_layer, auto_donor_mapping
 from .fusegpt_graft import (
     FusionLinear,
@@ -318,10 +318,10 @@ class CCTLlamaModel(nn.Module):
         entropy = -(probs * log_probs).sum(dim=-1)  # [B, T]
         h_norm_entropy = entropy / self.log_vocab_size.float()  # [0, 1]
 
-        # LM loss (如果有 labels)
+        # LM loss (如果有 labels) — per-sample for per-sample halt
         lm_loss = None
         if labels is not None:
-            lm_loss = compute_lm_loss(logits, labels)
+            lm_loss = compute_lm_loss_per_sample(logits, labels)  # [B]
 
         return entropy, h_norm_entropy, lm_loss
 
@@ -362,7 +362,7 @@ class CCTLlamaModel(nn.Module):
         for layer in self.front_layers:
             hidden_states = self._run_standard_layer(layer, hidden_states, layer_kwargs)
 
-        # === 3. Column 循环 (entropy-driven) ===
+        # === 3. Column 循环 (entropy-driven, per-sample halt) ===
         h = hidden_states
 
         # Column 层 SDPA 优化: 无 padding 时传 None mask → is_causal=True
@@ -372,9 +372,25 @@ class CCTLlamaModel(nn.Module):
         entropy_temperature = None  # 第一次迭代不调制
         all_entropies: List[torch.Tensor] = []
         all_lm_losses: List[torch.Tensor] = []
+        iter_active: List[torch.Tensor] = []   # per-iteration per-sample active mask
         num_iters_executed = 0
 
+        # Per-sample halt tracking
+        halted = torch.zeros(batch_size, dtype=torch.bool, device=h.device)
+        halt_iter = torch.full(
+            (batch_size,), self.config.max_iter,
+            dtype=torch.float, device=h.device,
+        )
+        h_at_halt = torch.zeros_like(h)  # frozen h for halted samples
+
         for k in range(self.config.max_iter):
+            active = ~halted  # [B] — samples still active at start of this iter
+            iter_active.append(active.clone())
+
+            # All samples halted → early exit
+            if not active.any():
+                break
+
             # a. 3个 CCTDecoderLayer forward (共享权重)
             for ci, col_layer in enumerate(self.column_layers):
                 col_cycle_k = k * len(self.column_layers) + ci
@@ -418,7 +434,7 @@ class CCTLlamaModel(nn.Module):
 
             all_entropies.append(h_norm)
             if lm_loss_k is not None:
-                all_lm_losses.append(lm_loss_k)
+                all_lm_losses.append(lm_loss_k)  # [B] per-sample
 
             num_iters_executed = k + 1
 
@@ -427,19 +443,33 @@ class CCTLlamaModel(nn.Module):
                 1.0 - self.config.entropy_temp_scale * h_norm.detach()
             ).clamp(min=0.5, max=1.0)  # [B, T]
 
-            # e. 硬停止 (训练和推理都执行, 保持 train/infer 对齐)
+            # e. Per-sample halt check
             if k >= self.config.min_iter - 1:
                 if attention_mask is not None:
-                    valid = attention_mask[:, :seq_len].bool()
-                    mean_h_norm = h_norm[valid].mean().item() if valid.any() else h_norm.mean().item()
+                    valid_tok = attention_mask[:, :seq_len].bool()  # [B, T]
+                    denom = valid_tok.float().sum(dim=-1).clamp(min=1)  # [B]
+                    sample_h = (h_norm * valid_tok.float()).sum(dim=-1) / denom  # [B]
                 else:
-                    mean_h_norm = h_norm.mean().item()
-                if mean_h_norm < self.config.halt_entropy_threshold:
-                    break
+                    sample_h = h_norm.mean(dim=-1)  # [B]
+
+                newly_halted = active & (sample_h < self.config.halt_entropy_threshold)
+                if newly_halted.any():
+                    halt_iter[newly_halted] = float(k + 1)
+                    h_at_halt[newly_halted] = h[newly_halted]
+                    halted = halted | newly_halted
+
+            # f. Restore halted samples' hidden states (freeze)
+            if halted.any() and k < self.config.max_iter - 1:
+                frozen_mask = halted[:, None, None].expand_as(h)
+                h = torch.where(frozen_mask, h_at_halt, h)
+
+        # Non-halted samples: use last iter's h
+        still_active = ~halted
+        if still_active.any():
+            h_at_halt[still_active] = h[still_active]
+        h = h_at_halt
 
         # === 4. 最终输出 ===
-        # 最后一次迭代已经跑过 back+norm+lm_head 算 entropy/loss，
-        # 但 h 仍是 column output (未经 back)，需要重新跑 back
         hidden_states = h
         for layer in self.back_layers:
             hidden_states = self._run_standard_layer(layer, hidden_states, layer_kwargs)
@@ -448,22 +478,22 @@ class CCTLlamaModel(nn.Module):
         hidden_states = self.final_norm(hidden_states)
         logits = self.lm_head(hidden_states)
 
-        # === 6. 计算损失 ===
+        # === 6. 计算损失 (per-sample halt aware) ===
         loss = None
         loss_dict = {}
 
         if labels is not None and all_lm_losses:
-            # L_mono 只在有监督的 token 上施加压力 (labels != -100)
             valid_mask = (labels != -100).float()
             if attention_mask is not None:
                 valid_mask = valid_mask * attention_mask[:, :seq_len].float()
 
             loss, loss_dict = compute_total_loss(
-                lm_losses=all_lm_losses,
+                per_sample_lm_losses=all_lm_losses,
                 entropies=all_entropies,
                 lambda_mono=self.config.lambda_mono,
                 valid_mask=valid_mask,
                 entropy_floor=self.config.entropy_floor,
+                iter_active=iter_active,
             )
 
         # 报告每次迭代的 mean±std entropy (仅有效 token)
@@ -501,7 +531,8 @@ class CCTLlamaModel(nn.Module):
             "loss": loss,
             "logits": logits,
             "loss_dict": loss_dict,
-            "num_iterations": num_iters_executed,
+            "num_iterations": halt_iter.mean().item(),
+            "halt_iter_std": halt_iter.std().item() if batch_size > 1 else 0.0,
             "mean_entropy": mean_entropy,
             "std_entropy": std_entropy,
             "per_iter_entropy": per_iter_entropy,
