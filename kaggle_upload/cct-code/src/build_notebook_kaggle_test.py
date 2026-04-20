@@ -163,7 +163,7 @@ CFG = {{
     'eval_chunks': 50,
     # --- CCT 架构超参 (可直接调) ---
     'max_iter': 6,
-    'lambda_mono': 100.0,
+    'lambda_mono': 1.0,
     'entropy_temp_scale': 0.5,
     'entropy_floor': 0.15,
     'halt_threshold_start': 0.5,

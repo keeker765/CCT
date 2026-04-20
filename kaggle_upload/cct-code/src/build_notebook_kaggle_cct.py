@@ -255,7 +255,7 @@ CFG = {
     'max_train_hours': 8.0,   # 超时自动保存并停止
     # --- CCT 架构超参 (可在 Kaggle 直接调) ---
     'max_iter': 6,
-    'lambda_mono': 100.0,     # L_mono 权重 (直接乘 l_mono)
+    'lambda_mono': 1.0,     # L_mono 权重 (直接乘 l_mono)
     'entropy_temp_scale': 0.5,
     'entropy_floor': 0.15,
     'halt_threshold_start': 0.5,

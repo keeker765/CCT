@@ -400,7 +400,7 @@ if train_files is not None:
                 s = sum(stds) / len(stds) if stds else 0
                 h_parts.append('%.3f±%.3f' % (m, s))
             h_str = '[' + ', '.join(h_parts) + ']'
-            th = compute_halt_threshold(gs + 1, max_steps, cct_config.halt_threshold_start, cct_config.halt_threshold_end)
+            th = compute_halt_threshold(gs + 1, max_steps, cct_config.halt_threshold_start, cct_config.halt_threshold_end, warmup_steps=CFG['warmup_steps'])
             print('[Step %d/%d] loss=%.4f | lm=%.4f Δh=%+.4f | '
                   'H=%s iters=%.1f±%.1f th=%.3f | '
                   'lr=%.2e | %.1fM tok | ETA %.0fm' % (
@@ -469,7 +469,7 @@ else:
                     s = sum(stds) / len(stds) if stds else 0
                     h_parts.append('%.3f±%.3f' % (m, s))
                 h_str = '[' + ', '.join(h_parts) + ']'
-                th = compute_halt_threshold(gs_count, max_steps, cct_config.halt_threshold_start, cct_config.halt_threshold_end)
+                th = compute_halt_threshold(gs_count, max_steps, cct_config.halt_threshold_start, cct_config.halt_threshold_end, warmup_steps=CFG['warmup_steps'])
                 print('[Step %d/%d] loss=%.4f | lm=%.4f Δh=%+.4f | '
                       'H=%s iters=%.1f±%.1f th=%.3f | '
                       'lr=%.2e | %.1fM tok | ETA %.0fm' % (
