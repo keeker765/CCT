@@ -453,9 +453,11 @@ class CCTLlamaModel(nn.Module):
             h = self.inter_iter_norm(h)
 
             # c. Entropy + LM loss (通过 back → norm → lm_head, chunked)
-            # chunked 已将峰值降至 ~5 GB, 无需 gradient_checkpoint
-            entropy, h_norm, lm_loss_k = self._compute_entropy_and_lm_loss(
+            # gradient_checkpoint: 释放 log_softmax 中间张量, 反向时重算
+            entropy, h_norm, lm_loss_k = torch.utils.checkpoint.checkpoint(
+                self._compute_entropy_and_lm_loss,
                 h, labels, layer_kwargs,
+                use_reentrant=False,
             )
 
             all_entropies.append(h_norm)
