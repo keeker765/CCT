@@ -243,8 +243,8 @@ from src.training.scheduler import get_cosine_schedule_with_warmup, compute_halt
 # === 超参数 ===
 CFG = {
     'max_steps': None,    # None = 自动按数据量算 (1 epoch)
-    'batch_size': 16,
-    'grad_accum': 2,
+    'batch_size': 8,
+    'grad_accum': 4,
     'max_seq_len': 2048,
     'lr': 2e-5,
     'new_lr': 5e-4,
