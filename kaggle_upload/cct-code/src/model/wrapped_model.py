@@ -447,7 +447,9 @@ class CCTLlamaModel(nn.Module):
             if not active.any():
                 break
 
-            # a. 3个 CCTDecoderLayer forward (共享权重, gradient_checkpoint 省 VRAM)
+            # a. 3个 CCTDecoderLayer forward (共享权重)
+            # Selective checkpoint: 偶数迭代 checkpoint, 奇数迭代直接 forward
+            use_ckpt = self._gradient_checkpointing and self.training and (k % 2 == 0)
             for ci, col_layer in enumerate(self.column_layers):
                 col_cycle_k = k * len(self.column_layers) + ci
                 col_temp = entropy_temperature if ci == 0 else None
@@ -458,7 +460,7 @@ class CCTLlamaModel(nn.Module):
                     cycle_k=col_cycle_k,
                     entropy_temperature=col_temp,
                 )
-                if self._gradient_checkpointing and self.training:
+                if use_ckpt:
                     h = torch.utils.checkpoint.checkpoint(
                         col_layer, h.to(self._model_dtype),
                         **col_kwargs, use_reentrant=False,
