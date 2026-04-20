@@ -250,7 +250,7 @@ CFG = {
     'new_lr': 5e-4,
     'max_grad_norm': 1.0,
     'weight_decay': 0.01,
-    'warmup_steps': 200,
+    'warmup_ratio': 0.02,  # warmup 占总步数比例
     'log_interval': 5,
     'eval_interval': 200,
     'eval_chunks': 100,
@@ -399,9 +399,8 @@ elif train_files is None and CFG['max_steps'] is None:
     CFG['max_steps'] = total_steps_ds
     print('Auto max_steps: %d samples / %d = %d steps' % (len(train_ds), eff_batch, CFG['max_steps']))
 
-if CFG['warmup_steps'] > CFG['max_steps'] // 5:
-    CFG['warmup_steps'] = max(CFG['max_steps'] // 10, 10)
-    print('Adjusted warmup to %d' % CFG['warmup_steps'])"""),
+CFG['warmup_steps'] = max(int(CFG['warmup_ratio'] * CFG['max_steps']), 10)
+print('Warmup: %.1f%% × %d = %d steps' % (CFG['warmup_ratio']*100, CFG['max_steps'], CFG['warmup_steps']))"""),
     ]
 
 
