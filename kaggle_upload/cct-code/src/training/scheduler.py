@@ -44,11 +44,17 @@ def compute_halt_threshold(
     total_steps: int,
     threshold_start: float = 0.8,
     threshold_end: float = 0.3,
+    warmup_steps: int = 0,
 ) -> float:
-    """线性退火 entropy halt 阈值: threshold_start → threshold_end
+    """Halt 阈值退火: warmup 阶段内 start → end，之后固定 end
 
-    训练初期阈值高 (不停), 随训练推进降至目标值 (逐渐允许提前停止)。
-    仅影响 eval 模式的推理停止行为, 不影响训练梯度。
+    - warmup_steps > 0: 仅在 warmup 期间从 start 线性降到 end，之后恒等于 end
+    - warmup_steps = 0: 全程线性退火 (旧行为)
     """
-    progress = min(1.0, current_step / max(1, total_steps))
+    if warmup_steps > 0:
+        if current_step >= warmup_steps:
+            return threshold_end
+        progress = current_step / max(1, warmup_steps)
+    else:
+        progress = min(1.0, current_step / max(1, total_steps))
     return threshold_start + (threshold_end - threshold_start) * progress
