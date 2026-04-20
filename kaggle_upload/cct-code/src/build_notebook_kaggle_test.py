@@ -337,7 +337,7 @@ max_steps = CFG['max_steps']
 eff_batch = CFG['batch_size'] * CFG['grad_accum']
 print('Training %d steps (eff_batch=%d)...' % (max_steps, eff_batch))
 
-avg = {{'total': 0, 'lm': 0, 'mono': 0, 'iters': 0}}
+avg = {{'total': 0, 'lm': 0, 'mono': 0, 'iters': 0, 'iters_std': 0}}
 avg_h_per_iter = []
 avg_n = 0
 
@@ -367,6 +367,7 @@ if train_files is not None:
             avg['lm'] += ld.get('loss_lm', 0)
             avg['mono'] += ld.get('loss_mono', 0)
             avg['iters'] += out.get('num_iterations', 0)
+            avg['iters_std'] += out.get('halt_iter_std', 0)
             avg_h_per_iter.append(out.get('per_iter_entropy', []))
             avg_n += 1
 
@@ -389,12 +390,12 @@ if train_files is not None:
             h_str = '[' + ', '.join(h_parts) + ']'
             th = compute_halt_threshold(gs + 1, max_steps, cct_config.halt_threshold_start, cct_config.halt_threshold_end)
             print('[Step %d/%d] loss=%.4f | lm=%.4f Δh=%+.4f | '
-                  'H=%s iters=%.1f th=%.3f | '
+                  'H=%s iters=%.1f±%.1f th=%.3f | '
                   'lr=%.2e | %.1fM tok | ETA %.0fm' % (
                 gs + 1, max_steps, avg['total']/n, avg['lm']/n, avg['mono']/n,
-                h_str, avg['iters']/n, th,
+                h_str, avg['iters']/n, avg['iters_std']/n, th,
                 optimizer.param_groups[0]['lr'], tokens_done / 1e6, eta_m))
-            avg = {{'total': 0, 'lm': 0, 'mono': 0, 'iters': 0}}
+            avg = {{'total': 0, 'lm': 0, 'mono': 0, 'iters': 0, 'iters_std': 0}}
             avg_h_per_iter = []
             avg_n = 0
 
@@ -439,6 +440,7 @@ else:
             avg['lm'] += ld.get('loss_lm', 0)
             avg['mono'] += ld.get('loss_mono', 0)
             avg['iters'] += out.get('num_iterations', 0)
+            avg['iters_std'] += out.get('halt_iter_std', 0)
             avg_h_per_iter.append(out.get('per_iter_entropy', []))
             avg_n += 1
             if gs_count % CFG['log_interval'] == 0:
@@ -457,12 +459,12 @@ else:
                 h_str = '[' + ', '.join(h_parts) + ']'
                 th = compute_halt_threshold(gs_count, max_steps, cct_config.halt_threshold_start, cct_config.halt_threshold_end)
                 print('[Step %d/%d] loss=%.4f | lm=%.4f Δh=%+.4f | '
-                      'H=%s iters=%.1f th=%.3f | '
+                      'H=%s iters=%.1f±%.1f th=%.3f | '
                       'lr=%.2e | %.1fM tok | ETA %.0fm' % (
                     gs_count, max_steps, avg['total']/n, avg['lm']/n, avg['mono']/n,
-                    h_str, avg['iters']/n, th,
+                    h_str, avg['iters']/n, avg['iters_std']/n, th,
                     optimizer.param_groups[0]['lr'], tokens_done / 1e6, eta_m))
-                avg = {{'total': 0, 'lm': 0, 'mono': 0, 'iters': 0}}
+                avg = {{'total': 0, 'lm': 0, 'mono': 0, 'iters': 0, 'iters_std': 0}}
                 avg_h_per_iter = []
                 avg_n = 0
             if gs_count % CFG['eval_interval'] == 0:
