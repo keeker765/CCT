@@ -51,9 +51,7 @@ class CCTConfig:
     entropy_temp_scale: float = 0.5  # per-query temperature: temp = 1 - scale * H_norm
     entropy_floor: float = 0.15      # L_mono entropy 地板: H_norm < floor 时不再奖励降低
     delta_max: float = 0.08          # L_mono 每步最大允许降幅 (控制迭代节奏)
-    halt_entropy_threshold: float = 0.2  # 推理硬停止最终阈值
-    halt_threshold_start: float = 0.5    # 退火起始阈值 (训练初期 eval 较宽松)
-    halt_threshold_end: float = 0.2      # 退火结束阈值 (= halt_entropy_threshold)
+    halt_entropy_threshold: float = 0.2  # 固定 halt 阈值 (不退火)
 
     # 训练
     learning_rate: float = 2e-5
