@@ -253,6 +253,15 @@ CFG = {
     'eval_chunks': 100,
     'save_interval': 500,     # checkpoint 保存间隔 (步数)
     'max_train_hours': 8.0,   # 超时自动保存并停止
+    # --- CCT 架构超参 (可在 Kaggle 直接调) ---
+    'max_iter': 6,
+    'lambda_mono': 100.0,     # L_mono 权重 (直接乘 l_mono)
+    'entropy_temp_scale': 0.5,
+    'entropy_floor': 0.15,
+    'halt_threshold_start': 0.5,
+    'halt_threshold_end': 0.2,
+    'use_fusion_graft': True,
+    'fusion_rank': 64,
 }
 
 # === 数据加载 ===
@@ -403,13 +412,16 @@ from transformers import LlamaForCausalLM
 DTYPE = torch.bfloat16
 
 cct_config = CCTConfig(
-    max_iter=6,
-    lambda_mono=100.0,
-    entropy_temp_scale=0.5,
-    halt_entropy_threshold=0.3,
+    max_iter=CFG['max_iter'],
+    lambda_mono=CFG['lambda_mono'],
+    entropy_temp_scale=CFG['entropy_temp_scale'],
+    entropy_floor=CFG['entropy_floor'],
+    halt_threshold_start=CFG['halt_threshold_start'],
+    halt_threshold_end=CFG['halt_threshold_end'],
+    halt_entropy_threshold=CFG['halt_threshold_end'],
     use_ffn_expansion=False,
-    use_fusion_graft=True,
-    fusion_rank=64,
+    use_fusion_graft=CFG['use_fusion_graft'],
+    fusion_rank=CFG['fusion_rank'],
     bf16=True,
     gradient_checkpointing=True,
     max_seq_len=CFG['max_seq_len'],
