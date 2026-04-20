@@ -453,10 +453,24 @@ class CCTLlamaModel(nn.Module):
             h = self.inter_iter_norm(h)
 
             # c. Entropy + LM loss (通过 back → norm → lm_head, chunked)
-            # chunked 已将峰值降至 ~5 GB, 无需 gradient_checkpoint
-            entropy, h_norm, lm_loss_k = self._compute_entropy_and_lm_loss(
-                h, labels, layer_kwargs,
-            )
+            # 中间迭代 no_grad 跳过 lm_head backward (省 ~60% 计算)
+            # h 的梯度图不受影响, LM loss 仍可回传到所有 column 层
+            use_grad = (k == 0) or (k == self.config.max_iter - 1) or not self.training
+            if self.training and not use_grad:
+                with torch.no_grad():
+                    entropy, h_norm, lm_loss_k = self._compute_entropy_and_lm_loss(
+                        h, labels, layer_kwargs,
+                    )
+            elif self._gradient_checkpointing and self.training:
+                entropy, h_norm, lm_loss_k = torch.utils.checkpoint.checkpoint(
+                    self._compute_entropy_and_lm_loss,
+                    h, labels, layer_kwargs,
+                    use_reentrant=False,
+                )
+            else:
+                entropy, h_norm, lm_loss_k = self._compute_entropy_and_lm_loss(
+                    h, labels, layer_kwargs,
+                )
 
             all_entropies.append(h_norm)
             if lm_loss_k is not None:

@@ -134,16 +134,38 @@ def compute_total_loss(
         total_loss: 总损失
         loss_dict: 各项损失详情
     """
-    # Per-sample weighted LM loss: 每个样本只 average 其 active 迭代
+    # LM loss: 只有第一和最后迭代有梯度 (中间迭代 no_grad)
+    # 使用第一+最后迭代的 loss 平均作为梯度源, 避免 1/K 稀释
     stacked = torch.stack(per_sample_lm_losses)  # [K, B]
+    K = len(per_sample_lm_losses)
 
+    # 有梯度的迭代: first (0) and last (K-1)
+    grad_losses = [per_sample_lm_losses[0]]
+    grad_active_masks = []
     if iter_active is not None:
-        active = torch.stack(iter_active[:len(per_sample_lm_losses)]).float()  # [K, B]
-        weighted = (stacked * active).sum(dim=0)  # [B]
-        counts = active.sum(dim=0).clamp(min=1)   # [B]
-        lm_loss = (weighted / counts).mean()       # scalar
+        grad_active_masks.append(iter_active[0].float())
+    if K > 1:
+        grad_losses.append(per_sample_lm_losses[-1])
+        if iter_active is not None:
+            grad_active_masks.append(iter_active[K - 1].float())
+
+    if iter_active is not None and grad_active_masks:
+        # 梯度 LM loss: 只用有梯度迭代的 weighted mean
+        grad_stack = torch.stack(grad_losses)      # [2, B]
+        active_stack = torch.stack(grad_active_masks)  # [2, B]
+        weighted = (grad_stack * active_stack).sum(dim=0)
+        counts = active_stack.sum(dim=0).clamp(min=1)
+        lm_loss = (weighted / counts).mean()
+
+        # 日志: 全迭代 weighted average (detached)
+        all_active = torch.stack(iter_active[:K]).float()
+        log_weighted = (stacked.detach() * all_active).sum(dim=0)
+        log_counts = all_active.sum(dim=0).clamp(min=1)
+        lm_loss_log = (log_weighted / log_counts).mean().item()
     else:
-        lm_loss = stacked.mean()
+        grad_stack = torch.stack(grad_losses)
+        lm_loss = grad_stack.mean()
+        lm_loss_log = stacked.detach().mean().item()
 
     # L_mono (with per-sample active masking and diff clamp)
     l_mono = compute_monotonic_entropy_loss(
@@ -155,7 +177,7 @@ def compute_total_loss(
 
     loss_dict = {
         "loss_total": total.item(),
-        "loss_lm": lm_loss.item(),
+        "loss_lm": lm_loss_log,  # 全迭代 average (用于监控)
         "loss_mono": l_mono.item(),
     }
 
