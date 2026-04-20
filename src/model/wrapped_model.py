@@ -579,7 +579,7 @@ class CCTLlamaModel(nn.Module):
             mono_entropies = all_probe_entropies if all_probe_entropies else all_entropies
             l_mono = compute_monotonic_entropy_loss(
                 mono_entropies, valid_mask, self.config.entropy_floor,
-                iter_active, self.config.max_iter,
+                iter_active, self.config.max_iter, self.config.delta_max,
             )
 
             total = lm_loss + self.config.lambda_mono * l_mono

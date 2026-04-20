@@ -261,6 +261,7 @@ CFG = {
     'lambda_mono': 1.0,     # L_mono 权重 (直接乘 l_mono)
     'entropy_temp_scale': 0.5,
     'entropy_floor': 0.15,
+    'delta_max': 0.08,      # L_mono 每步最大允许降幅 (控制迭代节奏)
     'halt_threshold_start': 0.5,
     'halt_threshold_end': 0.2,
     'halt_warmup_ratio': 0.1,  # halt threshold warmup 占总步数比例
@@ -420,6 +421,7 @@ cct_config = CCTConfig(
     lambda_mono=CFG['lambda_mono'],
     entropy_temp_scale=CFG['entropy_temp_scale'],
     entropy_floor=CFG['entropy_floor'],
+    delta_max=CFG['delta_max'],
     halt_threshold_start=CFG['halt_threshold_start'],
     halt_threshold_end=CFG['halt_threshold_end'],
     halt_entropy_threshold=CFG['halt_threshold_end'],
