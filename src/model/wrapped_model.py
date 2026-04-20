@@ -490,12 +490,19 @@ class CCTLlamaModel(nn.Module):
                 )
                 all_entropies.append(h_norm)
                 if lm_loss_k is not None:
-                    all_lm_losses.append(lm_loss_k)
+                    # Per-sample active masking: halted samples don't contribute LM loss
+                    all_lm_losses.append((lm_loss_k, active.clone()))
 
-                # Probe MSE: 用真实 entropy 训练 probe
+                # Probe MSE: 用真实 entropy 训练 probe (h.detach 防止梯度流回 column)
                 if self.training and labels is not None:
-                    probe_h_norm = self.entropy_probe(h)
-                    probe_mse = F.mse_loss(probe_h_norm, h_norm.detach())
+                    probe_h_norm = self.entropy_probe(h.detach())  # 梯度只到 probe
+                    # Mask padding tokens
+                    if attention_mask is not None:
+                        vmask = attention_mask[:, :seq_len].float()
+                        mse_per_tok = (probe_h_norm - h_norm.detach()) ** 2
+                        probe_mse = (mse_per_tok * vmask).sum() / vmask.sum().clamp(min=1)
+                    else:
+                        probe_mse = F.mse_loss(probe_h_norm, h_norm.detach())
                     all_probe_mse.append(probe_mse)
             else:
                 # 中间迭代: 完全跳过 lm_head, 只用 probe
@@ -571,9 +578,15 @@ class CCTLlamaModel(nn.Module):
             if attention_mask is not None:
                 valid_mask = valid_mask * attention_mask[:, :seq_len].float()
 
-            # LM loss: 直接平均 checkpoint 迭代的 LM losses
-            # 方案 B: 只有 checkpoint 迭代 (iter 0, K-1) 有 LM loss
-            lm_loss = torch.stack(all_lm_losses).mean(dim=0).mean()
+            # LM loss: halt-aware 平均 (只计算 active 样本)
+            # all_lm_losses: list of (loss_k [B], active_k [B])
+            weighted_sum = torch.zeros(1, device=h.device)
+            count_sum = torch.zeros(1, device=h.device)
+            for lm_k, active_k in all_lm_losses:
+                active_f = active_k.float()
+                weighted_sum = weighted_sum + (lm_k * active_f).sum()
+                count_sum = count_sum + active_f.sum()
+            lm_loss = weighted_sum / count_sum.clamp(min=1)
 
             # L_mono: probe entropy (所有迭代有梯度, 不优化 probe 权重)
             mono_entropies = all_probe_entropies if all_probe_entropies else all_entropies
