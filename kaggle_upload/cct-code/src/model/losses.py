@@ -29,6 +29,7 @@ def compute_lm_loss(
 def compute_monotonic_entropy_loss(
     entropies: List[torch.Tensor],
     valid_mask: Optional[torch.Tensor] = None,
+    entropy_floor: float = 0.0,
 ) -> torch.Tensor:
     """L_mono: 鼓励 entropy 在相邻迭代间递减
 
@@ -37,15 +38,23 @@ def compute_monotonic_entropy_loss(
     正值 = entropy 上升 → 惩罚 (增大 total loss)
     负值 = entropy 下降 → 奖励 (减小 total loss)
 
+    entropy_floor: H_norm 低于此值后不再奖励继续降低 (防止 entropy 崩溃)
+                   实现: clamp(H, min=floor) 再算 diff
+
     Args:
         entropies: [H_0, H_1, ..., H_{K-1}], 每个 [B, T]
         valid_mask: [B, T] — 1=有效, 0=padding
+        entropy_floor: H_norm 下限 (默认 0.0 = 无下限)
 
     Returns:
         l_mono: 标量 (可为负)
     """
     if len(entropies) < 2:
         return torch.tensor(0.0, device=entropies[0].device)
+
+    # clamp entropy — 低于 floor 的部分不参与梯度
+    if entropy_floor > 0:
+        entropies = [e.clamp(min=entropy_floor) for e in entropies]
 
     eps = 1e-8
     loss = torch.tensor(0.0, device=entropies[0].device)
@@ -65,6 +74,7 @@ def compute_total_loss(
     entropies: List[torch.Tensor],
     lambda_mono: float = 0.1,
     valid_mask: Optional[torch.Tensor] = None,
+    entropy_floor: float = 0.0,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """计算总损失 (自适应缩放)
 
@@ -78,6 +88,7 @@ def compute_total_loss(
         entropies: 每次迭代的 per-token entropy [B, T] list
         lambda_mono: L_mono 相对权重 (0.1 = 10% of LM)
         valid_mask: [B, T] — padding mask
+        entropy_floor: H_norm 下限 (低于此值不再奖励 entropy 降低)
 
     Returns:
         total_loss: 总损失
@@ -87,7 +98,7 @@ def compute_total_loss(
     lm_loss = torch.stack(lm_losses).mean()
 
     # L_mono
-    l_mono = compute_monotonic_entropy_loss(entropies, valid_mask)
+    l_mono = compute_monotonic_entropy_loss(entropies, valid_mask, entropy_floor)
 
     # 自适应缩放: mono 梯度 ≈ lambda_mono × LM 梯度
     mono_abs = l_mono.detach().abs().clamp(min=1e-6)
