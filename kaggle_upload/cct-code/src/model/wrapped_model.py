@@ -33,7 +33,7 @@ except ImportError:
 from .column_config import CCTConfig
 from .cct_decoder_layer import CCTDecoderLayer
 from .cycle_embedding import RotaryCycleEmbedding
-from .losses import compute_lm_loss, compute_lm_loss_per_sample, compute_total_loss
+from .losses import compute_total_loss
 from .net2wider import widen_mlp, widen_mlp_cross_layer, auto_donor_mapping
 from .fusegpt_graft import (
     FusionLinear,
@@ -295,33 +295,65 @@ class CCTLlamaModel(nn.Module):
         h: torch.Tensor,
         labels: Optional[torch.LongTensor],
         layer_kwargs: dict,
+        chunk_size: int = 256,
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
-        """通过 Back → Norm → LM_head 计算 entropy 和 LM loss
+        """通过 Back → Norm → LM_head 计算 entropy 和 LM loss (分块节省 VRAM)
+
+        分块处理避免同时 materialize 完整 [B, T, V] logits。
+        峰值从 ~58 GB 降至 ~5 GB (chunk=256, B=16, V=128K)。
 
         Returns:
             entropy: [B, T] — 原始 entropy (nats)
             h_norm_entropy: [B, T] — 归一化 entropy [0, 1]
-            lm_loss: 标量 (仅 labels 不为 None 时)
+            lm_loss: [B] per-sample (仅 labels 不为 None 时)
         """
-        # Back layers
         h_back = h
         for layer in self.back_layers:
             h_back = self._run_standard_layer(layer, h_back, layer_kwargs)
-
-        # Final norm + LM head
         h_back = self.final_norm(h_back)
-        logits = self.lm_head(h_back)
 
-        # Entropy: -Σ p log p (用 log_softmax 提高数值稳定性)
-        log_probs = F.log_softmax(logits.float(), dim=-1)
-        probs = log_probs.exp()
-        entropy = -(probs * log_probs).sum(dim=-1)  # [B, T]
-        h_norm_entropy = entropy / self.log_vocab_size.float()  # [0, 1]
+        B, T, _D = h_back.shape
+        entropy = torch.empty(B, T, device=h.device, dtype=torch.float32)
+        log_V = self.log_vocab_size.float()
 
-        # LM loss (如果有 labels) — per-sample for per-sample halt
+        # CE 累加器 (shifted: logits[i] 预测 labels[i+1])
+        compute_ce = labels is not None
+        if compute_ce:
+            ce_sum = torch.zeros(B, device=h.device, dtype=torch.float32)
+            valid_count = torch.zeros(B, device=h.device, dtype=torch.float32)
+
+        for start in range(0, T, chunk_size):
+            end = min(start + chunk_size, T)
+            logit_chunk = self.lm_head(h_back[:, start:end, :])  # [B, chunk, V]
+
+            # --- Entropy ---
+            log_p = F.log_softmax(logit_chunk.float(), dim=-1)
+            entropy[:, start:end] = -(log_p.exp() * log_p).sum(dim=-1)
+            del log_p
+
+            # --- CE (shifted) ---
+            # logit[pos] → label[pos+1], 最后一个 token 无 target
+            if compute_ce:
+                num_pairs = min(end, T - 1) - start
+                if num_pairs > 0:
+                    ce_logits = logit_chunk[:, :num_pairs, :]
+                    ce_labels = labels[:, start + 1 : start + 1 + num_pairs]
+                    per_tok = F.cross_entropy(
+                        ce_logits.reshape(-1, ce_logits.shape[-1]),
+                        ce_labels.reshape(-1),
+                        reduction='none',
+                    ).reshape(B, num_pairs)
+                    mask = (ce_labels != -100).float()
+                    ce_sum += (per_tok * mask).sum(dim=-1)
+                    valid_count += mask.sum(dim=-1)
+
+            del logit_chunk
+
+        h_norm_entropy = entropy / log_V
+
         lm_loss = None
-        if labels is not None:
-            lm_loss = compute_lm_loss_per_sample(logits, labels)  # [B]
+        if compute_ce:
+            lm_loss = ce_sum / valid_count.clamp(min=1)
 
         return entropy, h_norm_entropy, lm_loss
 
@@ -476,7 +508,8 @@ class CCTLlamaModel(nn.Module):
 
         # === 5. Final Norm + LM Head (最终 logits) ===
         hidden_states = self.final_norm(hidden_states)
-        logits = self.lm_head(hidden_states)
+        # 训练时跳过完整 logits (节省 ~8 GB), 推理时才需要
+        logits = self.lm_head(hidden_states) if labels is None else None
 
         # === 6. 计算损失 (per-sample halt aware) ===
         loss = None

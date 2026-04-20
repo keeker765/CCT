@@ -70,6 +70,9 @@ def build_notebook(model_path: str = DEFAULT_MODEL,
         code(f"""\
 import os, sys, gc, math, time, glob
 
+# 减少 CUDA 内存碎片
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
 MOUNT_MODEL = '{model_path}'
 MOUNT_DATA  = '{data_path}'
 MOUNT_CODE  = '{code_path}'

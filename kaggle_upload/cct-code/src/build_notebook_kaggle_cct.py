@@ -93,6 +93,9 @@ def cells_mount_config(model_path: str, data_path: str,
 # ╚══════════════════════════════════════════════════╝
 import os, sys
 
+# 减少 CUDA 内存碎片
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
+
 MOUNT_MODEL  = '{model_path}'   # 预训练模型
 MOUNT_DATA   = '{data_path}'    # 训练数据
 MOUNT_CODE   = '{code_path}'    # CCT 源代码
