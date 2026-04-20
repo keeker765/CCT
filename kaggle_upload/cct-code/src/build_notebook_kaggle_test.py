@@ -168,6 +168,7 @@ CFG = {{
     'entropy_floor': 0.15,
     'halt_threshold_start': 0.5,
     'halt_threshold_end': 0.2,
+    'halt_warmup_ratio': 0.1,
     'use_fusion_graft': True,
     'fusion_rank': 64,
 }}
@@ -400,7 +401,7 @@ if train_files is not None:
                 s = sum(stds) / len(stds) if stds else 0
                 h_parts.append('%.3f±%.3f' % (m, s))
             h_str = '[' + ', '.join(h_parts) + ']'
-            th = compute_halt_threshold(gs + 1, max_steps, cct_config.halt_threshold_start, cct_config.halt_threshold_end, warmup_steps=CFG['warmup_steps'])
+            th = compute_halt_threshold(gs + 1, max_steps, cct_config.halt_threshold_start, cct_config.halt_threshold_end, warmup_steps=int(max_steps * CFG['halt_warmup_ratio']))
             print('[Step %d/%d] loss=%.4f | lm=%.4f Δh=%+.4f | '
                   'H=%s iters=%.1f±%.1f th=%.3f | '
                   'lr=%.2e | %.1fM tok | ETA %.0fm' % (
@@ -469,7 +470,7 @@ else:
                     s = sum(stds) / len(stds) if stds else 0
                     h_parts.append('%.3f±%.3f' % (m, s))
                 h_str = '[' + ', '.join(h_parts) + ']'
-                th = compute_halt_threshold(gs_count, max_steps, cct_config.halt_threshold_start, cct_config.halt_threshold_end, warmup_steps=CFG['warmup_steps'])
+                th = compute_halt_threshold(gs_count, max_steps, cct_config.halt_threshold_start, cct_config.halt_threshold_end, warmup_steps=int(max_steps * CFG['halt_warmup_ratio']))
                 print('[Step %d/%d] loss=%.4f | lm=%.4f Δh=%+.4f | '
                       'H=%s iters=%.1f±%.1f th=%.3f | '
                       'lr=%.2e | %.1fM tok | ETA %.0fm' % (
