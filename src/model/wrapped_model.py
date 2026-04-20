@@ -429,12 +429,13 @@ class CCTLlamaModel(nn.Module):
             n: p.detach() for n, p in self.entropy_probe.named_parameters()
         }
 
-        # 随机选择 checkpoint 迭代: 最后一轮必选, 再随机选 1 轮
-        # 分散 probe MSE 训练信号到所有迭代深度 (不只是 0 和 K-1)
+        # 随机选择 checkpoint 迭代:
+        # iter 0 必选 (保证执行, 即使所有样本提前 halt)
+        # 再随机选 1 个其他迭代 (分散 probe MSE 训练信号)
         max_k = self.config.max_iter
         if self.training and max_k > 2:
-            random_idx = torch.randint(0, max_k - 1, (1,)).item()  # [0, K-2]
-            grad_iters = {random_idx, max_k - 1}
+            random_idx = torch.randint(1, max_k, (1,)).item()  # [1, K-1]
+            grad_iters = {0, random_idx}
         else:
             grad_iters = {0, max_k - 1}  # 推理/max_iter<=2: 固定首尾
 
