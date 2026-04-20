@@ -790,7 +790,7 @@ if train_files is not None:
             h_str = '[' + ', '.join(h_parts) + ']'
             th = compute_halt_threshold(gs + 1, max_steps, cct_config.halt_threshold_start, cct_config.halt_threshold_end)
             log_msg = ('[Step %d/%d] loss=%.4f | lm=%.4f Δh=%+.4f | '
-                  'H=%s iters=%d th=%.3f | '
+                  'H=%s iters=%.1f th=%.3f | '
                   'lr=%.2e | %.1fM tok | ETA %.0fm' % (
                 gs + 1, max_steps, avg['total']/n, avg['lm']/n, avg['mono']/n,
                 h_str, avg['iters']/n, th,
@@ -897,7 +897,7 @@ else:
                     h_str = '[' + ', '.join(h_parts) + ']'
                     th = compute_halt_threshold(gs_count, max_steps, cct_config.halt_threshold_start, cct_config.halt_threshold_end)
                     log_msg = ('[Step %d/%d] loss=%.4f | lm=%.4f Δh=%+.4f | '
-                          'H=%s iters=%d th=%.3f | '
+                          'H=%s iters=%.1f th=%.3f | '
                           'lr=%.2e | %.1fM tok | ETA %.0fm' % (
                         gs_count, max_steps, avg['total']/n, avg['lm']/n,
                         avg['mono']/n, h_str, avg['iters']/n, th,

@@ -5,10 +5,9 @@
 
 Entropy-driven halt:
 - 每次迭代后通过 Back → Norm → LM_head 计算输出分布 entropy
-- 训练: 跑满 max_iter, 所有迭代的 LM loss 取平均 (确保中间停止点有效)
-- 推理: mean(H_norm) < threshold → 硬停止
+- 训练/推理统一: mean(H_norm) < threshold → 硬停止 (train/infer 对齐)
 - Per-query attention temperature: temp = 1 - scale × H_norm
-- L_mono: 监督 entropy 逐迭代递减
+- L_mono: 监督 entropy 逐迭代递减 (entropy_floor 防崩溃)
 """
 
 import inspect
@@ -428,8 +427,8 @@ class CCTLlamaModel(nn.Module):
                 1.0 - self.config.entropy_temp_scale * h_norm.detach()
             ).clamp(min=0.5, max=1.0)  # [B, T]
 
-            # e. 推理时硬停止 (仅用有效 token 的均值)
-            if not self.training and k >= self.config.min_iter - 1:
+            # e. 硬停止 (训练和推理都执行, 保持 train/infer 对齐)
+            if k >= self.config.min_iter - 1:
                 if attention_mask is not None:
                     valid = attention_mask[:, :seq_len].bool()
                     mean_h_norm = h_norm[valid].mean().item() if valid.any() else h_norm.mean().item()
