@@ -3,7 +3,7 @@
 L_total = mean(L_LM_k, weighted by active mask) + λ_mono · L_mono
 
 - L_LM_k: 每次迭代通过 back+norm+lm_head 的 CrossEntropy (per-sample)
-- L_mono: entropy 方向损失 — 奖励递减，惩罚递增 (无 ReLU，双向)
+- L_mono: ReLU(H_{k+1} - H_k) — 仅惩罚 entropy 上升，不奖励下降
 - per-sample halt: 不同样本在不同迭代停止，只计入 active 迭代的损失
 """
 
@@ -55,14 +55,14 @@ def compute_monotonic_entropy_loss(
     entropy_floor: float = 0.0,
     iter_active: Optional[List[torch.Tensor]] = None,
 ) -> torch.Tensor:
-    """L_mono: 鼓励 entropy 在相邻迭代间递减
+    """L_mono: 惩罚 entropy 在相邻迭代间递增 (单向 ReLU)
 
-    L_mono = Σ_{k=0}^{K-2} masked_mean(H_{k+1} - H_k) / (K-1)
+    L_mono = Σ_{k=0}^{K-2} masked_mean(ReLU(H_{k+1} - H_k)) / (K-1)
 
-    正值 = entropy 上升 → 惩罚 (增大 total loss)
-    负值 = entropy 下降 → 奖励 (减小 total loss)
+    仅惩罚 entropy 上升 (正 diff)，不奖励 entropy 下降。
+    这样避免 lambda_mono 过大时总 loss 变负。
 
-    entropy_floor: H_norm 低于此值后不再奖励继续降低 (防止 entropy 崩溃)
+    entropy_floor: H_norm 低于此值后 diff 被 clamp → 不惩罚也不奖励
     iter_active: [active_0, active_1, ...] 每个 [B] bool — per-sample active mask
 
     Args:
@@ -72,7 +72,7 @@ def compute_monotonic_entropy_loss(
         iter_active: per-iteration per-sample active mask (None = all active)
 
     Returns:
-        l_mono: 标量 (可为负)
+        l_mono: 标量 (≥0)
     """
     if len(entropies) < 2:
         return torch.tensor(0.0, device=entropies[0].device)
@@ -85,7 +85,7 @@ def compute_monotonic_entropy_loss(
     n_diffs = 0
 
     for k in range(len(entropies) - 1):
-        diff = entropies[k + 1] - entropies[k]  # [B, T]
+        diff = F.relu(entropies[k + 1] - entropies[k])  # [B, T], only penalize increase
 
         # 两个迭代都 active 的样本才计入
         if iter_active is not None and k + 1 < len(iter_active):

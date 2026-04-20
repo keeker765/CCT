@@ -494,6 +494,7 @@ class CCTLlamaModel(nn.Module):
                 valid_mask=valid_mask,
                 entropy_floor=self.config.entropy_floor,
                 iter_active=iter_active,
+                max_iter=self.config.max_iter,
             )
 
         # 报告每次迭代的 mean±std entropy (仅有效 token)
